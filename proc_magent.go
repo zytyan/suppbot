@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"main/qbit"
+	"strings"
 	"sync"
 	"time"
 )
@@ -31,7 +32,7 @@ func getTorrentsCached() (map[string]qbit.Torrent, error) {
 	cachedTorrents.lastUpdate = time.Now()
 	var res = make(map[string]qbit.Torrent, len(torrents))
 	for _, t := range torrents {
-		res[t.Hash] = t
+		res[t.InfoHashV1] = t
 	}
 	cachedTorrents.torrents = res
 	return res, nil
@@ -45,11 +46,12 @@ func DownloadMagnet(hash []string) error {
 	// 删除已经存在的hash，否则会报错
 	ts := make(map[string]struct{}, len(torrents))
 	for _, t := range torrents {
-		ts[t.Hash] = struct{}{}
+		ts[strings.ToLower(t.InfoHashV1)] = struct{}{}
 	}
 	newHash := make([]string, 0, len(hash))
 	for _, h := range hash {
-		if _, ok := ts[h]; !ok {
+		if _, ok := ts[strings.ToLower(h)]; !ok {
+			log.Printf("hash = %s\n", h)
 			newHash = append(newHash, h)
 		}
 	}
