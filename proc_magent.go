@@ -59,7 +59,7 @@ func DownloadMagnet(hash []string) error {
 	return qClient.DownloadMagnetUrls(newHash)
 }
 
-func WaitAndProcMagnet(ctx context.Context, supp *Supp, hash string) (err error) {
+func WaitAndProcMagnet(ctx context.Context, manager *TaskManager, supp *Supp, hash string) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("supp %s, hash %s, panic: %v", supp.ArticleUrlPath, hash, r)
@@ -80,17 +80,37 @@ func WaitAndProcMagnet(ctx context.Context, supp *Supp, hash string) (err error)
 			if countNotInTorrents > 20 {
 				return nil
 			}
-		}
-		if torrent.Progress == 1 {
-			uploadVideos(&torrent, supp)
-			return UploadRawFiles(&torrent, supp)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(10 * time.Second):
+			}
+			continue
 		}
 		countNotInTorrents = 0
-		time.Sleep(10 * time.Second)
+		if manager != nil {
+			manager.UpdateTaskProgress(supp, string(TaskDownloading), fmt.Sprintf("下载中 %.1f%% %s", torrent.Progress*100, torrent.Name), hash)
+		}
+		if torrent.Progress == 1 {
+			if manager != nil {
+				manager.UpdateTaskProgress(supp, string(TaskUploadingVideo), "下载完成，开始上传视频", hash)
+			}
+			if err := uploadVideos(manager, &torrent, supp); err != nil {
+				return err
+			}
+			if manager != nil {
+				manager.UpdateTaskProgress(supp, string(TaskUploadingRaw), "开始上传原始文件", hash)
+			}
+			err := UploadRawFiles(manager, &torrent, supp)
+			if err == nil && manager != nil {
+				manager.IncrementDoneMagnet(supp)
+			}
+			return err
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		default:
+		case <-time.After(10 * time.Second):
 		}
 	}
 }

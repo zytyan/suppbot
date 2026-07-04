@@ -2,13 +2,11 @@ package main
 
 import (
 	"flag"
-	_ "github.com/mattn/go-sqlite3"
 	"main/qbit"
 	"os"
-)
 
-import (
 	"github.com/BurntSushi/toml"
+	_ "github.com/mattn/go-sqlite3"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -30,6 +28,7 @@ type SuppConfig struct {
 	AdminId        int64 `toml:"admin-id"`
 
 	TphAccessToken string `toml:"tph-access-token"`
+	WebAddr        string `toml:"web-addr"`
 
 	Qbit QbitConfig `toml:"qbit"`
 }
@@ -49,6 +48,9 @@ var config = func() SuppConfig {
 	_, err := toml.DecodeFile(file, &conf)
 	if err != nil {
 		panic(err)
+	}
+	if conf.WebAddr == "" {
+		conf.WebAddr = "127.0.0.1:8989"
 	}
 	qClient = qbit.NewClient(conf.Qbit.Host, conf.Qbit.User, conf.Qbit.Pass)
 	err = qClient.Login()

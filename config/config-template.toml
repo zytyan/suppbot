@@ -10,6 +10,7 @@ video-group-id = 0
 admin-id = 2718281828
 tph-access-token = "" # 这里原来是给telegra.ph使用的，现在因为不能上传图片了，暂且搁置
 database = "data.db" # 数据库名称，不用动
+web-addr = "127.0.0.1:8989" # 简易任务后台监听地址
 
 [qbit]
 # 很显然，这里是qBittorrent的地址

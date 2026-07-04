@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"github.com/PaulSonOfLars/gotgbot/v2"
 	"log"
@@ -86,7 +87,7 @@ func rarText(start, end, total int) string {
 		total, start, end, total)
 }
 
-func UploadRawFiles(t *qbit.Torrent, supp *Supp) error {
+func UploadRawFiles(manager *TaskManager, t *qbit.Torrent, supp *Supp) error {
 	const mediaGroupLimit = 10
 
 	path := t.ContentPath
@@ -106,6 +107,10 @@ func UploadRawFiles(t *qbit.Torrent, supp *Supp) error {
 	}
 	newFiles = strnum.SortedStrings(newFiles)
 	log.Printf("prepare to upload %d files\n", len(newFiles))
+	if manager != nil {
+		manager.AddMediaTotals(supp, -1, len(newFiles))
+	}
+	var errGroup error
 	for start, groupIdx := 0, 0; start < len(newFiles); start, groupIdx = start+mediaGroupLimit, groupIdx+1 {
 		end := min(start+mediaGroupLimit, len(newFiles))
 		fileGroup := newFiles[start:end]
@@ -122,20 +127,76 @@ func UploadRawFiles(t *qbit.Torrent, supp *Supp) error {
 			captionText := rarText(groupIdx*mediaGroupLimit+1, groupIdx*mediaGroupLimit+len(fileGroup), len(newFiles))
 			inputMedia[len(inputMedia)-1].(*gotgbot.InputMediaDocument).Caption = captionText
 		}
-		_, err = bot.SendMediaGroup(supp.LinkedGroupMsg.ChatId, inputMedia, &gotgbot.SendMediaGroupOpts{
-			ReplyParameters: &gotgbot.ReplyParameters{
-				MessageId:                supp.LinkedGroupMsg.Id,
-				ChatId:                   supp.LinkedGroupMsg.ChatId,
-				AllowSendingWithoutReply: false,
-				Quote:                    "",
-				QuoteParseMode:           "",
-				QuoteEntities:            nil,
-				QuotePosition:            0,
-			},
+		if manager != nil {
+			manager.UpdateTaskProgress(supp, string(TaskUploadingRaw), fmt.Sprintf("上传原始文件 %d-%d/%d", start+1, end, len(newFiles)), "")
+		}
+		reply := &gotgbot.ReplyParameters{
+			MessageId:                supp.LinkedGroupMsg.Id,
+			ChatId:                   supp.LinkedGroupMsg.ChatId,
+			AllowSendingWithoutReply: false,
+			Quote:                    "",
+			QuoteParseMode:           "",
+			QuoteEntities:            nil,
+			QuotePosition:            0,
+		}
+		if len(fileGroup) == 1 {
+			caption := ""
+			if files.isRar {
+				caption = rarText(groupIdx*mediaGroupLimit+1, groupIdx*mediaGroupLimit+len(fileGroup), len(newFiles))
+			}
+			msg, err := bot.SendDocument(supp.LinkedGroupMsg.ChatId, gotgbot.InputFileByURL(fileSchema(fileGroup[0])), &gotgbot.SendDocumentOpts{
+				Caption:         caption,
+				ReplyParameters: reply,
+			})
+			if err != nil {
+				log.Println(err)
+				errGroup = errors.Join(errGroup, err)
+				continue
+			}
+			if manager != nil {
+				role := "raw_file"
+				if files.isRar {
+					role = "rar_part"
+				}
+				groupKey := fmt.Sprintf("%s:raw:%d", supp.ArticleUrlPath, groupIdx)
+				if recErr := manager.RecordMessage(supp, msg, role, "document", "", caption, "", fileGroup[0], groupKey, 1, 1); recErr != nil {
+					log.Println(recErr)
+				}
+				manager.IncrementUploadedRaw(supp)
+			}
+			continue
+		}
+		msgs, err := bot.SendMediaGroup(supp.LinkedGroupMsg.ChatId, inputMedia, &gotgbot.SendMediaGroupOpts{
+			ReplyParameters: reply,
 		})
 		if err != nil {
 			log.Println(err)
+			errGroup = errors.Join(errGroup, err)
+			continue
+		}
+		if manager != nil {
+			groupKey := fmt.Sprintf("%s:raw:%d", supp.ArticleUrlPath, groupIdx)
+			for idx := range msgs {
+				caption := ""
+				if idx < len(inputMedia) {
+					if doc, ok := inputMedia[idx].(*gotgbot.InputMediaDocument); ok {
+						caption = doc.Caption
+					}
+				}
+				sourcePath := ""
+				if idx < len(fileGroup) {
+					sourcePath = fileGroup[idx]
+				}
+				role := "raw_file"
+				if files.isRar {
+					role = "rar_part"
+				}
+				if recErr := manager.RecordMessage(supp, &msgs[idx], role, "document", "", caption, "", sourcePath, groupKey, idx+1, len(fileGroup)); recErr != nil {
+					log.Println(recErr)
+				}
+				manager.IncrementUploadedRaw(supp)
+			}
 		}
 	}
-	return nil
+	return errGroup
 }
