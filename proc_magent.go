@@ -29,7 +29,7 @@ func getTorrentsCached() (map[string]qbit.Torrent, error) {
 	cachedTorrents.mu.Lock()
 	defer cachedTorrents.mu.Unlock()
 	cachedTorrents.lastUpdate = time.Now()
-	var res = make(map[string]qbit.Torrent, len(torrents))
+	res := make(map[string]qbit.Torrent, len(torrents))
 	for _, t := range torrents {
 		res[t.Hash] = t
 	}

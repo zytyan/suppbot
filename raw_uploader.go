@@ -87,13 +87,15 @@ func rarText(start, end, total int) string {
 }
 
 func UploadRawFiles(t *qbit.Torrent, supp *Supp) error {
+	const mediaGroupLimit = 10
+
 	path := t.ContentPath
 	files, err := prepareUploadFiles(path)
-	defer files.cleanup()
 	if err != nil {
 		log.Println(err)
 		return err
 	}
+	defer files.cleanup()
 	var newFiles []string
 	for _, file := range files.files {
 		if helper.IsVideoFile(file) {
@@ -104,9 +106,11 @@ func UploadRawFiles(t *qbit.Torrent, supp *Supp) error {
 	}
 	newFiles = strnum.SortedStrings(newFiles)
 	log.Printf("prepare to upload %d files\n", len(newFiles))
-	for chunkIdx, fileChunk := range helper.Chunk(newFiles, 10) {
-		inputMedia := make([]gotgbot.InputMedia, 0, len(fileChunk))
-		for _, f := range fileChunk {
+	for start, groupIdx := 0, 0; start < len(newFiles); start, groupIdx = start+mediaGroupLimit, groupIdx+1 {
+		end := min(start+mediaGroupLimit, len(newFiles))
+		fileGroup := newFiles[start:end]
+		inputMedia := make([]gotgbot.InputMedia, 0, len(fileGroup))
+		for _, f := range fileGroup {
 			log.Printf("send file to: %d, %s\n", supp.LinkedGroupMsg.ChatId, f)
 			inputMedia = append(inputMedia, &gotgbot.InputMediaDocument{
 				Media:     gotgbot.InputFileByURL(fileSchema(f)),
@@ -115,7 +119,7 @@ func UploadRawFiles(t *qbit.Torrent, supp *Supp) error {
 			})
 		}
 		if files.isRar {
-			captionText := rarText(chunkIdx*10+1, chunkIdx*10+len(fileChunk), len(newFiles))
+			captionText := rarText(groupIdx*mediaGroupLimit+1, groupIdx*mediaGroupLimit+len(fileGroup), len(newFiles))
 			inputMedia[len(inputMedia)-1].(*gotgbot.InputMediaDocument).Caption = captionText
 		}
 		_, err = bot.SendMediaGroup(supp.LinkedGroupMsg.ChatId, inputMedia, &gotgbot.SendMediaGroupOpts{

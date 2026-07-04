@@ -7,6 +7,8 @@ import (
 )
 
 func TestClient(t *testing.T) {
+	t.Skip("qBittorrent integration test is kept for reference, but local qbit is not available now")
+
 	as := assert.New(t)
 	c := NewClient("http://localhost:8888", "test", "testtest")
 	as.NotNil(c)

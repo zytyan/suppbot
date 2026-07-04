@@ -102,30 +102,23 @@ func startSupp(supp *Supp) {
 	supp.barrier.Wait()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Hour)
 	defer cancel()
-	wg := sync.WaitGroup{}
 	errChan := make(chan error, len(supp.Magnets))
+	var wg sync.WaitGroup
 	for idx, hash := range supp.Magnets {
 		log.Printf("start proc magnet[%d] %s\n", idx, hash)
-		wg.Add(1)
-		go func(h string) {
-			defer wg.Done()
-			err := WaitAndProcMagnet(ctx, supp, h)
+		wg.Go(func() {
+			err := WaitAndProcMagnet(ctx, supp, hash)
 			if err != nil {
 				errChan <- err
 				log.Println(err)
 			}
-		}(hash)
+		})
 	}
 	wg.Wait()
+	close(errChan)
 	var errGroup error
-Loop:
-	for {
-		select {
-		case e := <-errChan:
-			errGroup = errors.Join(errGroup, e)
-		default:
-			break Loop
-		}
+	for err := range errChan {
+		errGroup = errors.Join(errGroup, err)
 	}
 	if errGroup != nil {
 		supp.Status = "error"
@@ -143,7 +136,10 @@ func sendSuppMsg(article *crawler.Article, supp *Supp) error {
 	text := prepareMsgText(article)
 	imgFile, err := article.DownloadImgToFile()
 	if err != nil {
-		imgFile = "no_image.png"
+		imgFile, err = noImageFile()
+		if err != nil {
+			return err
+		}
 	} else {
 		defer os.Remove(imgFile)
 	}
@@ -244,15 +240,16 @@ func IsAutoForwardedSuppMsg(msg *gotgbot.Message) bool {
 	if ori.Chat.Id != config.ChannelId {
 		return false
 	}
-	return true
+	return ori.MessageId != 0
 }
 
 func OnLinkedGroupMsg(_ *gotgbot.Bot, ctx *ext.Context) error {
 	mu.Lock()
 	defer mu.Unlock()
 	msg := ctx.EffectiveMessage
-	cid := msg.ForwardOrigin.MergeMessageOrigin().Chat.Id
-	mid := msg.ForwardOrigin.MergeMessageOrigin().MessageId
+	origin := msg.ForwardOrigin.MergeMessageOrigin()
+	cid := origin.Chat.Id
+	mid := origin.MessageId
 	key := Msg{ChatId: cid, Id: mid}
 	supp, ok := runningSupp.GetByMsg(key)
 	log.Printf("get linked group msg, channel id: %d, channel msg id: %d, group id: %d, group msg id: %d", cid, mid, msg.Chat.Id, msg.MessageId)

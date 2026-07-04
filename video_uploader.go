@@ -150,9 +150,12 @@ func uploadOneVideo(video string, supp *Supp) error {
 func uploadVideos(t *qbit.Torrent, supp *Supp) {
 	path := t.ContentPath
 	var videos []string
-	err := filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
+	err := filepath.WalkDir(path, func(path string, entry os.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		if entry.IsDir() {
+			return nil
 		}
 		if helper.IsVideoFile(path) {
 			videos = append(videos, path)
