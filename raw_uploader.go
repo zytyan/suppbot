@@ -1,13 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"github.com/PaulSonOfLars/gotgbot/v2"
+	"github.com/zytyan/suppbot/archive_proc"
+	"github.com/zytyan/suppbot/helper"
+	"github.com/zytyan/suppbot/qbit"
+	"github.com/zytyan/suppbot/strnum"
 	"log"
-	"main/archive_proc"
-	"main/helper"
-	"main/qbit"
-	"main/strnum"
 	"os"
 	"path/filepath"
 	"time"
@@ -115,11 +116,11 @@ func uploadFile(supp *Supp, file, captionText string) error {
 func UploadRawFiles(t *qbit.Torrent, supp *Supp) error {
 	path := t.ContentPath
 	files, err := prepareUploadFiles(path)
-	defer files.cleanup()
 	if err != nil {
 		log.Println(err)
 		return err
 	}
+	defer files.cleanup()
 	var newFiles []string
 	for _, file := range files.files {
 		if helper.IsVideoFile(file) {
@@ -130,6 +131,7 @@ func UploadRawFiles(t *qbit.Torrent, supp *Supp) error {
 	}
 	newFiles = strnum.SortedStrings(newFiles)
 	log.Printf("prepare to upload %d files\n", len(newFiles))
+	var uploadErr error
 	for idx, filename := range newFiles {
 		caption := ""
 		if files.isRar {
@@ -138,8 +140,8 @@ func UploadRawFiles(t *qbit.Torrent, supp *Supp) error {
 		err := uploadFile(supp, filename, caption)
 		if err != nil {
 			log.Println(err)
+			uploadErr = errors.Join(uploadErr, fmt.Errorf("upload %s: %w", filename, err))
 		}
 	}
-	return nil
+	return uploadErr
 }
-

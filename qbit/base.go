@@ -43,6 +43,36 @@ func checkOk(r io.Reader) error {
 	return nil
 }
 
+func checkLoginOk(r io.Reader) error {
+	buf, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	if len(buf) == 0 || bytes.Equal(buf, []byte("Ok.")) {
+		return nil
+	}
+	return errors.New("Qbit return: " + string(buf))
+}
+
+func checkTorrentAddOk(r io.Reader) error {
+	buf, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	if bytes.Equal(buf, []byte("Ok.")) {
+		return nil
+	}
+	var result struct {
+		FailureCount int `json:"failure_count"`
+		SuccessCount int `json:"success_count"`
+		PendingCount int `json:"pending_count"`
+	}
+	if err := json.Unmarshal(buf, &result); err == nil && result.FailureCount == 0 && result.SuccessCount+result.PendingCount > 0 {
+		return nil
+	}
+	return errors.New("Qbit return: " + string(buf))
+}
+
 func checkEmpty(r io.Reader) error {
 	buf, err := io.ReadAll(r)
 	if err != nil {
@@ -163,7 +193,7 @@ func (c *Client) Login() error {
 		return err
 	}
 	defer resp.Body.Close()
-	if err = checkOk(resp.Body); err != nil {
+	if err = checkLoginOk(resp.Body); err != nil {
 		return err
 	}
 	c.cookie = resp.Header.Get("Set-Cookie")
@@ -211,7 +241,7 @@ func (c *Client) DownloadMagnetUrls(magnets []string) error {
 		return err
 	}
 	defer resp.Body.Close()
-	if err = checkOk(resp.Body); err != nil {
+	if err = checkTorrentAddOk(resp.Body); err != nil {
 		return err
 	}
 	return nil

@@ -4,4 +4,10 @@
 /config/*
 !/config/config-template.toml
 /*.db
+/*.db.*
 /*.service
+/suppbot
+/suppbot.*
+/liuli.link
+/.agents/
+/.codex/

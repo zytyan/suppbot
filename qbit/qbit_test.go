@@ -2,11 +2,15 @@ package qbit
 
 import (
 	"github.com/stretchr/testify/assert"
+	"os"
 	"strings"
 	"testing"
 )
 
 func TestClient(t *testing.T) {
+	if os.Getenv("SUPPBOT_QBIT_INTEGRATION") == "" {
+		t.Skip("set SUPPBOT_QBIT_INTEGRATION=1 to run against localhost:8888")
+	}
 	as := assert.New(t)
 	c := NewClient("http://localhost:8888", "test", "testtest")
 	as.NotNil(c)

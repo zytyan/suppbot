@@ -7,10 +7,10 @@ import (
 	"fmt"
 	"github.com/PaulSonOfLars/gotgbot/v2"
 	"github.com/PaulSonOfLars/gotgbot/v2/ext"
+	"github.com/zytyan/suppbot/crawler"
 	"gorm.io/gorm"
 	"html"
 	"log"
-	"main/crawler"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -41,12 +41,28 @@ func (m *TypeMagnets) Scan(value any) error {
 	if !ok {
 		return fmt.Errorf("failed to scan value type(%s):%s to TypeMagnets", reflect.TypeOf(value), value)
 	}
-	*m = strings.Split(str, ",")
+	if strings.TrimSpace(str) == "" {
+		*m = nil
+		return nil
+	}
+	parts := strings.Split(str, ",")
+	*m = (*m)[:0]
+	for _, part := range parts {
+		if hash := strings.TrimSpace(part); hash != "" {
+			*m = append(*m, hash)
+		}
+	}
 	return nil
 }
 
 func (m TypeMagnets) Value() (driver.Value, error) {
-	return strings.Join(m, ","), nil
+	valid := make([]string, 0, len(m))
+	for _, hash := range m {
+		if hash = strings.TrimSpace(hash); hash != "" {
+			valid = append(valid, hash)
+		}
+	}
+	return strings.Join(valid, ","), nil
 }
 
 type Supp struct {
@@ -94,9 +110,19 @@ func prepareMsgText(article *crawler.Article) string {
 }
 
 func startSupp(supp *Supp) {
+	if len(supp.Magnets) == 0 {
+		supp.Status = "error"
+		runningSupp.Remove(supp)
+		db.Save(supp)
+		log.Printf("supp %s has no magnets, marked error\n", supp.ArticleUrlPath)
+		return
+	}
 	err := DownloadMagnet(supp.Magnets)
 	if err != nil {
 		log.Println(err)
+		supp.Status = "error"
+		runningSupp.Remove(supp)
+		db.Save(supp)
 		return
 	}
 	supp.barrier.Wait()
@@ -184,22 +210,41 @@ func ProcArticle(article *crawler.Article) error {
 	supp := &Supp{ArticleUrlPath: urlPath}
 	err := db.Take(supp).Error
 	if err == nil {
-		switch supp.Status {
-		case "running":
-			log.Printf("supp %s is running, current status %s, chnnel id: %d, channel msg id: %d, group id: %d, group msg id: %d\n",
-				article.Title, supp.Status, supp.ChannelMsg.ChatId, supp.ChannelMsg.Id, supp.LinkedGroupMsg.ChatId, supp.LinkedGroupMsg.Id)
-		case "error":
-			log.Printf("supp %s error, current status %s, chnnel id: %d, channel msg id: %d, group id: %d, group msg id: %d\n",
-				article.Title, supp.Status, supp.ChannelMsg.ChatId, supp.ChannelMsg.Id, supp.LinkedGroupMsg.ChatId, supp.LinkedGroupMsg.Id)
-			return nil
-		case "done":
-			log.Printf("supp %s already done, skip\n", article.Title)
-			return nil
+		if len(supp.Magnets) == 0 {
+			magnets, magnetErr := crawler.GetMagnetsFromLink(article.Url)
+			if magnetErr != nil || len(magnets) == 0 {
+				supp.Status = "error"
+				db.Save(supp)
+				if magnetErr != nil {
+					return magnetErr
+				}
+				return fmt.Errorf("article %s has no magnet hashes", article.Url)
+			}
+			supp.Magnets = magnets
+			supp.Status = "running"
+			db.Save(supp)
+			log.Printf("supp %s recovered %d missing magnets\n", article.Title, len(magnets))
+		} else {
+			switch supp.Status {
+			case "running":
+				log.Printf("supp %s is running, current status %s, chnnel id: %d, channel msg id: %d, group id: %d, group msg id: %d\n",
+					article.Title, supp.Status, supp.ChannelMsg.ChatId, supp.ChannelMsg.Id, supp.LinkedGroupMsg.ChatId, supp.LinkedGroupMsg.Id)
+			case "error":
+				log.Printf("supp %s error, current status %s, chnnel id: %d, channel msg id: %d, group id: %d, group msg id: %d\n",
+					article.Title, supp.Status, supp.ChannelMsg.ChatId, supp.ChannelMsg.Id, supp.LinkedGroupMsg.ChatId, supp.LinkedGroupMsg.Id)
+				return nil
+			case "done":
+				log.Printf("supp %s already done, skip\n", article.Title)
+				return nil
+			}
 		}
 	} else {
 		magnets, err := crawler.GetMagnetsFromLink(article.Url)
 		if err != nil {
 			return err
+		}
+		if len(magnets) == 0 {
+			return fmt.Errorf("article %s has no magnet hashes", article.Url)
 		}
 		supp.Magnets = magnets
 	}

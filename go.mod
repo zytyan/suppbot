@@ -1,4 +1,4 @@
-module main
+module github.com/zytyan/suppbot
 
 go 1.23
 

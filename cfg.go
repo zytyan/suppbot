@@ -1,10 +1,11 @@
 package main
 
 import (
-	"flag"
 	_ "github.com/mattn/go-sqlite3"
-	"main/qbit"
+	"github.com/zytyan/suppbot/qbit"
 	"os"
+	"strconv"
+	"strings"
 )
 
 import (
@@ -70,11 +71,16 @@ type flags struct {
 var globalFlags = flags{}
 
 func parseFlags() {
-	parser := flag.NewFlagSet("supp", flag.ExitOnError)
-	parser.BoolVar(&globalFlags.UseTest, "test", false, "use test config")
-	parser.IntVar(&globalFlags.LiuliPage, "page", 0, "liuli page")
-	err := parser.Parse(os.Args[1:])
-	if err != nil {
-		panic(err)
+	for i := 1; i < len(os.Args); i++ {
+		arg := os.Args[i]
+		switch {
+		case arg == "-test":
+			globalFlags.UseTest = true
+		case arg == "-page" && i+1 < len(os.Args):
+			i++
+			globalFlags.LiuliPage, _ = strconv.Atoi(os.Args[i])
+		case strings.HasPrefix(arg, "-page="):
+			globalFlags.LiuliPage, _ = strconv.Atoi(strings.TrimPrefix(arg, "-page="))
+		}
 	}
 }

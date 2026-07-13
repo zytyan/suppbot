@@ -2,20 +2,26 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/PaulSonOfLars/gotgbot/v2"
 	"github.com/disintegration/imaging"
+	"github.com/zytyan/suppbot/helper"
+	"github.com/zytyan/suppbot/qbit"
+	"github.com/zytyan/suppbot/strnum"
+	"github.com/zytyan/suppbot/videoproc"
 	"gopkg.in/vansante/go-ffprobe.v2"
 	"html"
 	"log"
-	"main/helper"
-	"main/qbit"
-	"main/strnum"
-	"main/videoproc"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"time"
 )
+
+var retryAfterPattern = regexp.MustCompile(`(?i)retry after\s+(\d+)`)
 
 func toThumbnail(imgFile string) (string, error) {
 	img, err := imaging.Open(imgFile)
@@ -83,10 +89,43 @@ func uploadOneVideo(video string, supp *Supp) error {
 		return err
 	}
 	v := probe.FirstVideoStream()
+	if a := probe.FirstAudioStream(); a != nil && a.CodecName != "aac" {
+		tmpDir, err := os.MkdirTemp("", "encode_to_aac")
+		if err != nil {
+			goto audioDone
+		}
+		defer os.RemoveAll(tmpDir)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute*20)
+		defer cancel()
+		videoFilename := filepath.Base(video)
+		tmpVideoFilepath := filepath.Join(tmpDir, videoFilename)
+		// 非AAC编码，使用ffmpeg将编码转换为AAC
+		cmd := exec.CommandContext(ctx, "ffmpeg",
+			"-v", "error",
+			"-i", video,
+			"-c:v", "copy", "-c:a", "aac",
+			"-b:a", "192k",
+			tmpVideoFilepath)
+		err = cmd.Start()
+		if err != nil {
+			goto audioDone
+		}
+		err = cmd.Wait()
+		if err != nil {
+			goto audioDone
+		}
+		video = tmpVideoFilepath
+		newProbe, err := ffprobe.ProbeURL(context.Background(), tmpVideoFilepath)
+		if err != nil {
+			goto audioDone
+		}
+		probe = newProbe
+	}
+audioDone:
 	coverFile := gotgbot.InputFileByURL(fileSchema(thumbnail))
 	log.Printf("send video %s to: %d\n", video, config.VideoChannelId)
 	groupMsg, err := bot.SendPhoto(supp.LinkedGroupMsg.ChatId, coverFile, &gotgbot.SendPhotoOpts{
-		Caption:    fmt.Sprintf("视频正在上传中 (%s)", time.Now().Format("2006-01-02 15:04:05")),
+		Caption:    fmt.Sprintf("%s", filepath.Base(video)),
 		HasSpoiler: true,
 		ReplyParameters: &gotgbot.ReplyParameters{
 			MessageId:                supp.LinkedGroupMsg.Id,
@@ -147,7 +186,7 @@ func uploadOneVideo(video string, supp *Supp) error {
 	return err
 }
 
-func uploadVideos(t *qbit.Torrent, supp *Supp) {
+func uploadVideos(t *qbit.Torrent, supp *Supp) error {
 	path := t.ContentPath
 	var videos []string
 	err := filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
@@ -160,15 +199,38 @@ func uploadVideos(t *qbit.Torrent, supp *Supp) {
 		return nil
 	})
 	if err != nil {
-		log.Println(err)
-		return
+		return err
 	}
 	videos = strnum.SortedStrings(videos)
 	log.Printf("prepare to upload %d videos\n", len(videos))
+	var uploadErr error
 	for _, video := range videos {
-		err := uploadOneVideo(video, supp)
+		err := uploadVideoWithRetry(video, supp, uploadOneVideo, time.Sleep)
 		if err != nil {
 			log.Println(err)
+			uploadErr = errors.Join(uploadErr, err)
 		}
 	}
+	return uploadErr
+}
+
+func uploadVideoWithRetry(video string, supp *Supp, upload func(string, *Supp) error, sleep func(time.Duration)) error {
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		lastErr = upload(video, supp)
+		if lastErr == nil {
+			return nil
+		}
+		match := retryAfterPattern.FindStringSubmatch(lastErr.Error())
+		if len(match) != 2 || attempt == maxAttempts {
+			return lastErr
+		}
+		seconds, err := strconv.Atoi(match[1])
+		if err != nil {
+			return lastErr
+		}
+		sleep(time.Duration(seconds+1) * time.Second)
+	}
+	return lastErr
 }
