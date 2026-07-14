@@ -1,6 +1,7 @@
 package videoproc
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -13,7 +14,81 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
+
+const (
+	TargetVideoBitRate = int64(8_000_000)
+	TargetAudioBitRate = int64(192_000)
+)
+
+type ProgressFunc func(time.Duration)
+
+func runFFmpegWithProgress(ctx context.Context, args []string, callbacks ...ProgressFunc) error {
+	if len(args) == 0 {
+		return errors.New("ffmpeg output argument is missing")
+	}
+	output := args[len(args)-1]
+	args = append(args[:len(args)-1], "-progress", "pipe:1", "-nostats", output)
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	stderr := bytes.NewBuffer(nil)
+	cmd.Stderr = stderr
+	if err = cmd.Start(); err != nil {
+		return err
+	}
+	scanner := bufio.NewScanner(stdout)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "out_time_us=") {
+			continue
+		}
+		elapsed, parseErr := time.ParseDuration(strings.TrimPrefix(line, "out_time_us=") + "us")
+		if parseErr == nil {
+			for _, callback := range callbacks {
+				if callback != nil {
+					callback(elapsed)
+				}
+			}
+		}
+	}
+	if scanErr := scanner.Err(); scanErr != nil {
+		_ = cmd.Wait()
+		return scanErr
+	}
+	if err = cmd.Wait(); err != nil {
+		return fmt.Errorf("ffmpeg failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
+}
+
+func TranscodeForTelegram(ctx context.Context, input, output string, copyAAC bool, callbacks ...ProgressFunc) error {
+	args := []string{
+		"-y", "-v", "error", "-i", input,
+		"-map", "0:v:0", "-map", "0:a:0?",
+		"-c:v", "libx264", "-preset", "medium",
+		"-b:v", "8000000", "-maxrate", "8000000", "-bufsize", "16000000",
+		"-pix_fmt", "yuv420p",
+	}
+	if copyAAC {
+		args = append(args, "-c:a", "copy")
+	} else {
+		args = append(args, "-c:a", "aac", "-b:a", "192000")
+	}
+	args = append(args, "-movflags", "+faststart", output)
+	return runFFmpegWithProgress(ctx, args, callbacks...)
+}
+
+func ConvertAudioToAAC(ctx context.Context, input, output string, callbacks ...ProgressFunc) error {
+	return runFFmpegWithProgress(ctx, []string{
+		"-y", "-v", "error", "-i", input,
+		"-map", "0:v:0", "-map", "0:a:0?",
+		"-c:v", "copy", "-c:a", "aac", "-b:a", "192000",
+		"-movflags", "+faststart", output}, callbacks...)
+}
 
 var FontFilePath = "static/NotoSans-Regular.ttf"
 

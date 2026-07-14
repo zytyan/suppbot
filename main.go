@@ -11,7 +11,6 @@ import (
 
 func main() {
 	var err error
-	go SuppLoop()
 	bot, err = gotgbot.NewBot(config.BotToken, &gotgbot.BotOpts{
 		BotClient: &gotgbot.BaseBotClient{
 			Client:             http.Client{},
@@ -25,6 +24,10 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	if err = startAdminServer(); err != nil {
+		panic(err)
+	}
+	go SuppLoop()
 	dispatcher := ext.NewDispatcher(nil)
 	updater := ext.NewUpdater(dispatcher, &ext.UpdaterOpts{
 		UnhandledErrFunc: nil,

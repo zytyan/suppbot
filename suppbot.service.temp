@@ -9,6 +9,7 @@ Restart=on-failure
 RestartSec=5s
 Type=simple
 Environment="TZ=Asia/Shanghai"
+Environment="SUPPBOT_ADMIN_LISTEN=127.0.0.1:9001"
 KillSignal=SIGINT
 WorkingDirectory=VAR_CUR_PATH
 ExecStart=VAR_CUR_PATH/VAR_BIN_NAME

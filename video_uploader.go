@@ -14,7 +14,6 @@ import (
 	"html"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -22,6 +21,12 @@ import (
 )
 
 var retryAfterPattern = regexp.MustCompile(`(?i)retry after\s+(\d+)`)
+
+const (
+	videoBitRateThreshold = int64(12_000_000)
+	maxVideoUploadSize    = int64(2_000_000_000)
+	containerOverhead     = 1.03
+)
 
 func toThumbnail(imgFile string) (string, error) {
 	img, err := imaging.Open(imgFile)
@@ -69,124 +74,181 @@ func getVideoTechSpecs(probe *ffprobe.ProbeData) string {
 	return fmt.Sprintf("视频编码: %s\n分辨率: %dx%d\n帧率: %s\n%s", v.CodecName, v.Width, v.Height, v.AvgFrameRate, audio)
 }
 
-func uploadOneVideo(video string, supp *Supp) error {
-	log.Printf("send video to: %d, %s\n", config.VideoChannelId, video)
-	thumbnail, err := videoproc.MakeScreenShotTileFile(video, 3, 3)
-	var thumbnailFile *gotgbot.FileReader
-	if err != nil {
-		thumbnail = ""
-		log.Println(err)
-	} else {
-		defer os.Remove(thumbnail)
-		t, err := tgThumbnail(thumbnail)
-		if err == nil {
-			thumbnailFile = gotgbot.InputFileByURL(t).(*gotgbot.FileReader)
-		}
+func streamBitRate(stream *ffprobe.Stream) (int64, bool) {
+	if stream == nil || stream.BitRate == "" {
+		return 0, false
 	}
-	probe, err := ffprobe.ProbeURL(context.Background(), video)
-	if err != nil {
-		log.Printf("ffprobe %s failed: %s\n", video, err)
-		return err
+	bitRate, err := strconv.ParseInt(stream.BitRate, 10, 64)
+	return bitRate, err == nil && bitRate > 0
+}
+
+func estimatedTranscodedSize(duration float64, audioBitRate int64) int64 {
+	if duration <= 0 {
+		return 0
 	}
-	v := probe.FirstVideoStream()
-	if a := probe.FirstAudioStream(); a != nil && a.CodecName != "aac" {
-		tmpDir, err := os.MkdirTemp("", "encode_to_aac")
-		if err != nil {
-			goto audioDone
-		}
-		defer os.RemoveAll(tmpDir)
-		ctx, cancel := context.WithTimeout(context.Background(), time.Minute*20)
-		defer cancel()
-		videoFilename := filepath.Base(video)
-		tmpVideoFilepath := filepath.Join(tmpDir, videoFilename)
-		// 非AAC编码，使用ffmpeg将编码转换为AAC
-		cmd := exec.CommandContext(ctx, "ffmpeg",
-			"-v", "error",
-			"-i", video,
-			"-c:v", "copy", "-c:a", "aac",
-			"-b:a", "192k",
-			tmpVideoFilepath)
-		err = cmd.Start()
-		if err != nil {
-			goto audioDone
-		}
-		err = cmd.Wait()
-		if err != nil {
-			goto audioDone
-		}
-		video = tmpVideoFilepath
-		newProbe, err := ffprobe.ProbeURL(context.Background(), tmpVideoFilepath)
-		if err != nil {
-			goto audioDone
-		}
-		probe = newProbe
-	}
-audioDone:
-	coverFile := gotgbot.InputFileByURL(fileSchema(thumbnail))
-	log.Printf("send video %s to: %d\n", video, config.VideoChannelId)
-	groupMsg, err := bot.SendPhoto(supp.LinkedGroupMsg.ChatId, coverFile, &gotgbot.SendPhotoOpts{
-		Caption:    fmt.Sprintf("%s", filepath.Base(video)),
-		HasSpoiler: true,
-		ReplyParameters: &gotgbot.ReplyParameters{
-			MessageId:                supp.LinkedGroupMsg.Id,
-			ChatId:                   supp.LinkedGroupMsg.ChatId,
-			AllowSendingWithoutReply: false,
-			Quote:                    "",
-			QuoteParseMode:           "",
-			QuoteEntities:            nil,
-			QuotePosition:            0,
-		},
-	})
-	if err != nil {
-		log.Printf("send video %s cover failed: %s\n", video, err)
-	}
-	var groupId, groupMsgId int64
-	if groupMsg != nil {
-		groupId, groupMsgId = groupMsg.Chat.Id, groupMsg.MessageId
-	}
-	videoMsg, err := bot.SendVideo(config.VideoChannelId, gotgbot.InputFileByURL(fileSchema(video)), &gotgbot.SendVideoOpts{
-		Caption:           filepath.Base(video) + "\n" + getVideoTechSpecs(probe),
-		ParseMode:         "",
-		Thumbnail:         thumbnailFile,
-		HasSpoiler:        true,
-		Width:             int64(v.Width),
-		Height:            int64(v.Height),
-		Duration:          int64(probe.Format.DurationSeconds),
-		SupportsStreaming: true,
-		ReplyParameters: &gotgbot.ReplyParameters{
-			MessageId:                groupMsgId,
-			ChatId:                   groupId,
-			AllowSendingWithoutReply: false,
-			Quote:                    "",
-			QuoteParseMode:           "",
-			QuoteEntities:            nil,
-			QuotePosition:            0,
-		},
-	})
-	if err != nil {
-		var err2 error
-		if groupMsg != nil {
-			_, _, err2 = groupMsg.EditCaption(bot, &gotgbot.EditMessageCaptionOpts{
-				Caption:   "视频上传失败",
-				ParseMode: gotgbot.ParseModeHTML,
-			})
-		}
-		return fmt.Errorf("send video %s failed: %w, err2: %w", video, err, err2)
-	}
-	username := videoMsg.Chat.Username
-	link := html.EscapeString(fmt.Sprintf("https://t.me/%s/%d", username, videoMsg.MessageId))
-	linkedText := fmt.Sprintf(`<a href="%s">%s</a>`, link, html.EscapeString(filepath.Base(video)))
-	text := linkedText
-	if groupMsg != nil {
-		_, _, err = groupMsg.EditCaption(bot, &gotgbot.EditMessageCaptionOpts{
-			Caption:   text,
-			ParseMode: gotgbot.ParseModeHTML,
-		})
+	bits := float64(videoproc.TargetVideoBitRate+audioBitRate) * duration
+	return int64(bits / 8 * containerOverhead)
+}
+
+func processedVideoName(video string) string {
+	return helper.Stem(filepath.Base(video)) + ".mp4"
+}
+
+func failVideoRecord(record *SendRecord, err error) error {
+	if saveErr := markSendRecordFailed(record, err); saveErr != nil {
+		return errors.Join(err, saveErr)
 	}
 	return err
 }
 
-func uploadVideos(t *qbit.Torrent, supp *Supp) error {
+func uploadOneVideo(video, sourcePath string, supp *Supp, torrentRecord *SuppTorrent) error {
+	log.Printf("prepare video for channel %d: %s\n", config.VideoChannelId, video)
+	probe, err := ffprobe.ProbeURL(context.Background(), video)
+	if err != nil {
+		return err
+	}
+	v := probe.FirstVideoStream()
+	if v == nil || probe.Format == nil {
+		return fmt.Errorf("ffprobe %s returned no video stream or format", video)
+	}
+	stat, err := os.Stat(video)
+	if err != nil {
+		return err
+	}
+	videoBitRate, hasVideoBitRate := streamBitRate(v)
+	audio := probe.FirstAudioStream()
+	audioBitRate, hasAudioBitRate := streamBitRate(audio)
+	copyAAC := audio != nil && audio.CodecName == "aac" && hasAudioBitRate
+	if audio != nil && !copyAAC {
+		audioBitRate = videoproc.TargetAudioBitRate
+	}
+	fullTranscode := stat.Size() > maxVideoUploadSize || (hasVideoBitRate && videoBitRate > videoBitRateThreshold)
+	needsAudioConversion := audio != nil && !copyAAC
+	fileName := filepath.Base(video)
+	if fullTranscode || needsAudioConversion {
+		fileName = processedVideoName(video)
+	}
+	record, skip, err := prepareSendRecord(torrentRecord, sourcePath, SendTypeVideo, fileName)
+	if err != nil || skip {
+		return err
+	}
+
+	if fullTranscode {
+		if probe.Format.DurationSeconds <= 0 {
+			return failVideoRecord(record, errors.New("cannot estimate transcoded size without video duration"))
+		}
+		estimatedSize := estimatedTranscodedSize(probe.Format.DurationSeconds, audioBitRate)
+		if estimatedSize > maxVideoUploadSize {
+			reason := fmt.Sprintf("estimated transcoded size %d exceeds limit %d", estimatedSize, maxVideoUploadSize)
+			return markSendRecordSkipped(record, reason)
+		}
+	}
+
+	sendVideo := video
+	if fullTranscode || needsAudioConversion {
+		tmpDir, tmpErr := os.MkdirTemp("", "suppbot-video-")
+		if tmpErr != nil {
+			return failVideoRecord(record, tmpErr)
+		}
+		defer os.RemoveAll(tmpDir)
+		sendVideo = filepath.Join(tmpDir, fileName)
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Hour)
+		defer cancel()
+		if fullTranscode {
+			trackTorrentWork(supp, torrentRecord.Hash, "视频转码", video, 0, 1, 0, 0, nil)
+			err = videoproc.TranscodeForTelegram(ctx, video, sendVideo, copyAAC, func(elapsed time.Duration) {
+				progress := elapsed.Seconds() / probe.Format.DurationSeconds
+				if progress > 1 {
+					progress = 1
+				}
+				trackTorrentWork(supp, torrentRecord.Hash, "视频转码", video, 0, 1, 0, progress, nil)
+			})
+		} else {
+			trackTorrentWork(supp, torrentRecord.Hash, "音频转换", video, 0, 1, 0, 0, nil)
+			err = videoproc.ConvertAudioToAAC(ctx, video, sendVideo, func(elapsed time.Duration) {
+				progress := elapsed.Seconds() / probe.Format.DurationSeconds
+				if progress > 1 {
+					progress = 1
+				}
+				trackTorrentWork(supp, torrentRecord.Hash, "音频转换", video, 0, 1, 0, progress, nil)
+			})
+		}
+		if err != nil {
+			return failVideoRecord(record, err)
+		}
+		stat, err = os.Stat(sendVideo)
+		if err != nil {
+			return failVideoRecord(record, err)
+		}
+		if stat.Size() > maxVideoUploadSize {
+			reason := fmt.Sprintf("actual transcoded size %d exceeds limit %d", stat.Size(), maxVideoUploadSize)
+			return markSendRecordSkipped(record, reason)
+		}
+		probe, err = ffprobe.ProbeURL(context.Background(), sendVideo)
+		if err != nil {
+			return failVideoRecord(record, err)
+		}
+		v = probe.FirstVideoStream()
+		if v == nil || probe.Format == nil {
+			return failVideoRecord(record, errors.New("ffprobe returned no stream for processed video"))
+		}
+	}
+
+	trackTorrentWork(supp, torrentRecord.Hash, "生成视频截图", sendVideo, 0, 1, 0, 1, nil)
+	thumbnail, err := videoproc.MakeScreenShotTileFile(sendVideo, 3, 3)
+	if err != nil {
+		return failVideoRecord(record, err)
+	}
+	defer os.Remove(thumbnail)
+	thumbURL, err := tgThumbnail(thumbnail)
+	var thumbnailFile *gotgbot.FileReader
+	if err == nil {
+		thumbnailFile = gotgbot.InputFileByURL(thumbURL).(*gotgbot.FileReader)
+		defer os.Remove(thumbnail + ".thumb.jpg")
+	}
+
+	if record.GroupMessageID == 0 {
+		groupMsg, sendErr := bot.SendPhoto(supp.LinkedGroupMsg.ChatId, gotgbot.InputFileByURL(fileSchema(thumbnail)), &gotgbot.SendPhotoOpts{
+			Caption: filepath.Base(sendVideo), HasSpoiler: true,
+			ReplyParameters: &gotgbot.ReplyParameters{MessageId: supp.LinkedGroupMsg.Id, ChatId: supp.LinkedGroupMsg.ChatId},
+		})
+		if sendErr != nil {
+			return failVideoRecord(record, sendErr)
+		}
+		record.GroupChatID, record.GroupMessageID = groupMsg.Chat.Id, groupMsg.MessageId
+		if err := db.Save(record).Error; err != nil {
+			return err
+		}
+	}
+
+	trackTorrentWork(supp, torrentRecord.Hash, "上传视频", sendVideo, 0, 1, 1, 1, nil)
+	videoMsg, err := bot.SendVideo(config.VideoChannelId, gotgbot.InputFileByURL(fileSchema(sendVideo)), &gotgbot.SendVideoOpts{
+		Caption: filepath.Base(sendVideo) + "\n" + getVideoTechSpecs(probe), Thumbnail: thumbnailFile,
+		HasSpoiler: true, Width: int64(v.Width), Height: int64(v.Height), Duration: int64(probe.Format.DurationSeconds), SupportsStreaming: true,
+		ReplyParameters: &gotgbot.ReplyParameters{MessageId: record.GroupMessageID, ChatId: record.GroupChatID},
+	})
+	if err != nil {
+		_, _, editErr := bot.EditMessageCaption(&gotgbot.EditMessageCaptionOpts{ChatId: record.GroupChatID, MessageId: record.GroupMessageID, Caption: "视频上传失败"})
+		return failVideoRecord(record, errors.Join(fmt.Errorf("send video %s: %w", sendVideo, err), editErr))
+	}
+	if videoMsg.Video == nil {
+		return failVideoRecord(record, errors.New("telegram response has no video"))
+	}
+	record.Status, record.Error = SendStatusSuccess, ""
+	record.FileID, record.FileUniqueID = videoMsg.Video.FileId, videoMsg.Video.FileUniqueId
+	record.ChannelChatID, record.ChannelMessageID = videoMsg.Chat.Id, videoMsg.MessageId
+	if err := db.Save(record).Error; err != nil {
+		return err
+	}
+	link := html.EscapeString(fmt.Sprintf("https://t.me/%s/%d", videoMsg.Chat.Username, videoMsg.MessageId))
+	text := fmt.Sprintf(`<a href="%s">%s</a>`, link, html.EscapeString(filepath.Base(sendVideo)))
+	if _, _, editErr := bot.EditMessageCaption(&gotgbot.EditMessageCaptionOpts{ChatId: record.GroupChatID, MessageId: record.GroupMessageID, Caption: text, ParseMode: gotgbot.ParseModeHTML}); editErr != nil {
+		log.Printf("edit video link caption failed: %s", editErr)
+	}
+	return nil
+}
+
+func uploadVideos(t *qbit.Torrent, supp *Supp, torrentRecord *SuppTorrent) error {
 	path := t.ContentPath
 	var videos []string
 	err := filepath.Walk(path, func(path string, info os.FileInfo, err error) error {
@@ -204,21 +266,24 @@ func uploadVideos(t *qbit.Torrent, supp *Supp) error {
 	videos = strnum.SortedStrings(videos)
 	log.Printf("prepare to upload %d videos\n", len(videos))
 	var uploadErr error
-	for _, video := range videos {
-		err := uploadVideoWithRetry(video, supp, uploadOneVideo, time.Sleep)
+	for index, video := range videos {
+		trackTorrentWork(supp, torrentRecord.Hash, "处理视频", video, index, len(videos), 0, 1, nil)
+		err := uploadVideoWithRetry(video, torrentSourcePath(path, video), supp, torrentRecord, uploadOneVideo, time.Sleep)
 		if err != nil {
 			log.Println(err)
 			uploadErr = errors.Join(uploadErr, err)
 		}
 	}
+	trackTorrentWork(supp, torrentRecord.Hash, "视频处理完成", "", len(videos), len(videos), 0, 1, uploadErr)
 	return uploadErr
 }
 
-func uploadVideoWithRetry(video string, supp *Supp, upload func(string, *Supp) error, sleep func(time.Duration)) error {
+func uploadVideoWithRetry(video, sourcePath string, supp *Supp, torrent *SuppTorrent, upload func(string, string, *Supp, *SuppTorrent) error, sleep func(time.Duration)) error {
 	const maxAttempts = 3
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		lastErr = upload(video, supp)
+		trackTorrentWork(supp, torrent.Hash, "处理视频", video, 0, 0, attempt, 1, nil)
+		lastErr = upload(video, sourcePath, supp, torrent)
 		if lastErr == nil {
 			return nil
 		}

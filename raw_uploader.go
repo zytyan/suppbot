@@ -27,6 +27,9 @@ func rarFiles(file string) (p *preparedFiles, err error) {
 	p = &preparedFiles{isRar: true}
 	rarName := stem + ".rar"
 	err = archive_proc.PackToRar(file, dir, rarName)
+	if err != nil {
+		return
+	}
 	p.cleanupFn = func() { os.RemoveAll(dir) }
 	var entries []os.DirEntry
 	entries, err = os.ReadDir(dir)
@@ -88,10 +91,12 @@ func rarText(index, total int) string {
 		total, index, total)
 }
 
-func uploadFile(supp *Supp, file, captionText string) error {
+func uploadFile(supp *Supp, torrent *SuppTorrent, record *SendRecord, file, captionText string, index, total int) error {
 	doc := gotgbot.InputFileByURL(fileSchema(file))
 	const retryCount = 5
+	var lastErr error
 	for i := 0; i < retryCount; i++ {
+		trackTorrentWork(supp, torrent.Hash, "上传文件", file, index, total, i+1, 1, nil)
 		msg, err := bot.SendDocument(supp.LinkedGroupMsg.ChatId, doc, &gotgbot.SendDocumentOpts{
 			Caption: captionText,
 			ReplyParameters: &gotgbot.ReplyParameters{
@@ -105,16 +110,37 @@ func uploadFile(supp *Supp, file, captionText string) error {
 			},
 		})
 		if err == nil {
+			if msg.Document == nil {
+				err = errors.New("telegram response has no document")
+			} else {
+				record.Status = SendStatusSuccess
+				record.Error = ""
+				record.FileID = msg.Document.FileId
+				record.FileUniqueID = msg.Document.FileUniqueId
+				record.GroupChatID = msg.Chat.Id
+				record.GroupMessageID = msg.MessageId
+				if saveErr := db.Save(record).Error; saveErr != nil {
+					return saveErr
+				}
+			}
+		}
+		if err == nil {
 			log.Printf("send message to chat %d msg id: %d\n", msg.Chat.Id, msg.MessageId)
 			return nil
 		}
+		lastErr = err
 		time.Sleep(1 * time.Minute)
 	}
-	return fmt.Errorf("send message failed total count %d", retryCount)
+	err := fmt.Errorf("send message failed after %d attempts: %w", retryCount, lastErr)
+	if saveErr := markSendRecordFailed(record, err); saveErr != nil {
+		return errors.Join(err, saveErr)
+	}
+	return err
 }
 
-func UploadRawFiles(t *qbit.Torrent, supp *Supp) error {
+func UploadRawFiles(t *qbit.Torrent, supp *Supp, torrentRecord *SuppTorrent) error {
 	path := t.ContentPath
+	trackTorrentWork(supp, torrentRecord.Hash, "准备文件或打包", path, 0, 0, 0, 1, nil)
 	files, err := prepareUploadFiles(path)
 	if err != nil {
 		log.Println(err)
@@ -134,14 +160,31 @@ func UploadRawFiles(t *qbit.Torrent, supp *Supp) error {
 	var uploadErr error
 	for idx, filename := range newFiles {
 		caption := ""
+		sendType := SendTypeOriginal
+		sourcePath := torrentSourcePath(path, filename)
 		if files.isRar {
 			caption = rarText(idx+1, len(newFiles))
+			sendType = SendTypeArchive
+			if len(newFiles) > 1 {
+				sendType = SendTypeSplitArchive
+			}
+			sourcePath = "archive:" + filepath.Base(filename)
 		}
-		err := uploadFile(supp, filename, caption)
+		record, skip, err := prepareSendRecord(torrentRecord, sourcePath, sendType, filepath.Base(filename))
+		if err != nil {
+			uploadErr = errors.Join(uploadErr, err)
+			continue
+		}
+		if skip {
+			log.Printf("skip previously completed file %s\n", filename)
+			continue
+		}
+		err = uploadFile(supp, torrentRecord, record, filename, caption, idx, len(newFiles))
 		if err != nil {
 			log.Println(err)
 			uploadErr = errors.Join(uploadErr, fmt.Errorf("upload %s: %w", filename, err))
 		}
 	}
+	trackTorrentWork(supp, torrentRecord.Hash, "文件上传完成", "", len(newFiles), len(newFiles), 0, 1, uploadErr)
 	return uploadErr
 }

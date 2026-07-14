@@ -76,7 +76,7 @@ type Supp struct {
 }
 
 func init() {
-	err := db.AutoMigrate(&Supp{})
+	err := migrateSendRecords()
 	if err != nil {
 		panic(err)
 	}
@@ -110,10 +110,12 @@ func prepareMsgText(article *crawler.Article) string {
 }
 
 func startSupp(supp *Supp) {
+	trackSuppPhase(supp, "添加 torrent", nil)
 	if len(supp.Magnets) == 0 {
 		supp.Status = "error"
 		runningSupp.Remove(supp)
 		db.Save(supp)
+		trackSuppDone(supp, errors.New("no magnets"))
 		log.Printf("supp %s has no magnets, marked error\n", supp.ArticleUrlPath)
 		return
 	}
@@ -123,9 +125,12 @@ func startSupp(supp *Supp) {
 		supp.Status = "error"
 		runningSupp.Remove(supp)
 		db.Save(supp)
+		trackSuppDone(supp, err)
 		return
 	}
+	trackSuppPhase(supp, "等待关联群消息", nil)
 	supp.barrier.Wait()
+	trackSuppPhase(supp, "处理 torrent", nil)
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Hour)
 	defer cancel()
 	wg := sync.WaitGroup{}
@@ -161,6 +166,7 @@ Loop:
 	runningSupp.Remove(supp)
 	log.Printf("supp %s done, current running %d\n", supp.ArticleUrlPath, runningSupp.Size())
 	db.Save(supp)
+	trackSuppDone(supp, errGroup)
 }
 
 var mu sync.Mutex
@@ -189,6 +195,12 @@ func sendSuppMsg(article *crawler.Article, supp *Supp) error {
 	key := Msg{ChatId: msg.Chat.Id, Id: msg.MessageId}
 	supp.ChannelMsg = key
 	supp.Status = "running"
+	if err := db.Save(supp).Error; err != nil {
+		return err
+	}
+	if err := ensureSuppTorrents(supp, TorrentStatusPending); err != nil {
+		return err
+	}
 	supp.barrier.Add(1)
 	runningSupp.Add(supp)
 	return nil
@@ -247,6 +259,9 @@ func ProcArticle(article *crawler.Article) error {
 			return fmt.Errorf("article %s has no magnet hashes", article.Url)
 		}
 		supp.Magnets = magnets
+		if err := db.Create(supp).Error; err != nil {
+			return err
+		}
 	}
 	log.Printf("start proc article %s, now time: %s, current running %d\n", article.Title, time.Now().Format("2006-01-02 15:04:05"), runningSupp.Size())
 	if supp.ChannelMsg.Id == 0 || supp.LinkedGroupMsg.Id == 0 {
@@ -254,27 +269,37 @@ func ProcArticle(article *crawler.Article) error {
 	} else {
 		runningSupp.Add(supp)
 	}
+	if err != nil {
+		return err
+	}
+	trackSuppStart(supp, "准备补档")
 	go startSupp(supp)
-	return err
+	return nil
 }
 
-func suppLoopInner() {
+func suppLoopInner() error {
 	articles, err := crawler.GetArticles(globalFlags.LiuliPage)
 	if err != nil {
 		log.Println(err)
-		return
+		return err
 	}
+	var loopErr error
 	for _, article := range articles {
 		err = ProcArticle(&article)
 		if err != nil {
 			log.Println(err)
+			loopErr = errors.Join(loopErr, err)
 		}
 	}
+	return loopErr
 }
 func SuppLoop() {
+	const interval = 2 * time.Hour
 	for {
-		suppLoopInner()
-		time.Sleep(2 * time.Hour)
+		trackCrawlStart()
+		err := suppLoopInner()
+		trackCrawlEnd(err, interval)
+		time.Sleep(interval)
 	}
 }
 

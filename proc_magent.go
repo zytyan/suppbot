@@ -13,6 +13,7 @@ import (
 
 var cachedTorrents struct {
 	mu         sync.RWMutex
+	refreshMu  sync.Mutex
 	torrents   map[string]qbit.Torrent
 	lastUpdate time.Time
 }
@@ -33,8 +34,19 @@ func getTorrentsCached() (map[string]qbit.Torrent, error) {
 		return cachedTorrents.torrents, nil
 	}
 	cachedTorrents.mu.RUnlock()
+	cachedTorrents.refreshMu.Lock()
+	defer cachedTorrents.refreshMu.Unlock()
+	cachedTorrents.mu.RLock()
+	if time.Since(cachedTorrents.lastUpdate) < torrentCacheTTL {
+		defer cachedTorrents.mu.RUnlock()
+		return cachedTorrents.torrents, nil
+	}
+	cachedTorrents.mu.RUnlock()
 	torrents, err := getTorrents()
 	if err != nil {
+		runtimeState.Lock()
+		runtimeState.torrentCacheErr = err.Error()
+		runtimeState.Unlock()
 		return nil, err
 	}
 	cachedTorrents.mu.Lock()
@@ -50,6 +62,9 @@ func getTorrentsCached() (map[string]qbit.Torrent, error) {
 		}
 	}
 	cachedTorrents.torrents = res
+	runtimeState.Lock()
+	runtimeState.torrentCacheErr = ""
+	runtimeState.Unlock()
 	return res, nil
 }
 
@@ -90,6 +105,28 @@ func WaitAndProcMagnet(ctx context.Context, supp *Supp, hash string) (err error)
 	}()
 	countNotInTorrents := 0
 	hash = strings.ToLower(hash)
+	trackTorrent(supp, hash, "等待 qBittorrent", nil)
+	torrentRecord, err := getSuppTorrent(supp, hash)
+	if err != nil {
+		return err
+	}
+	if err := setTorrentStatus(torrentRecord, TorrentStatusProcessing, nil); err != nil {
+		return err
+	}
+	defer func() {
+		status := TorrentStatusDone
+		if err != nil {
+			status = TorrentStatusError
+		}
+		if statusErr := setTorrentStatus(torrentRecord, status, err); statusErr != nil {
+			err = errors.Join(err, statusErr)
+		}
+		if err != nil {
+			trackTorrentWork(supp, hash, "失败", "", 0, 0, 0, -1, err)
+		} else {
+			trackTorrentWork(supp, hash, "完成", "", 1, 1, 0, 1, nil)
+		}
+	}()
 	for {
 		torrents, err := getTorrentsCached()
 		if err != nil {
@@ -103,15 +140,18 @@ func WaitAndProcMagnet(ctx context.Context, supp *Supp, hash string) (err error)
 			if countNotInTorrents >= maxTorrentMisses {
 				return fmt.Errorf("magnet %s not found in qBittorrent after %d checks", hash, countNotInTorrents)
 			}
+			trackTorrentWork(supp, hash, "等待 qBittorrent", "", countNotInTorrents, maxTorrentMisses, 0, 0, nil)
 			if err := waitForNextMagnetPoll(ctx); err != nil {
 				return err
 			}
 			continue
 		}
 		countNotInTorrents = 0
+		trackTorrent(supp, hash, "下载", &torrent)
 		if torrent.Progress >= 1 {
-			videoErr := uploadTorrentVideos(&torrent, supp)
-			filesErr := uploadTorrentFiles(&torrent, supp)
+			trackTorrent(supp, hash, "处理下载内容", &torrent)
+			videoErr := uploadTorrentVideos(&torrent, supp, torrentRecord)
+			filesErr := uploadTorrentFiles(&torrent, supp, torrentRecord)
 			return errors.Join(videoErr, filesErr)
 		}
 		if err := waitForNextMagnetPoll(ctx); err != nil {
