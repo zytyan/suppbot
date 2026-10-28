@@ -10,6 +10,7 @@ import { MediaProcessor } from './media.ts';
 import { crawlLoop, Worker } from './worker.ts';
 import { adminHandler } from './admin.ts';
 import { errorText } from './types.ts';
+import { SearchService } from './search-service.ts';
 
 // The SQLite backup API includes committed WAL content without copying a live database file.
 export async function backupBeforeMigration(path: string): Promise<string | undefined> {
@@ -58,6 +59,7 @@ export async function main(): Promise<void> {
     throw new Error('Another Deno suppbot instance holds the database lock');
   }
   let store: Store | undefined;
+  let search: SearchService | undefined;
   try {
     const backup = await backupBeforeMigration(config.database);
     if (backup) console.log(`Pre-migration database backup: ${backup}`);
@@ -69,7 +71,9 @@ export async function main(): Promise<void> {
     const runtime = new Runtime(config.concurrency),
       crawler = new Crawler(),
       qbit = new QbitClient(config.qbit);
-    const bot = createBot(config, store), telegram = new TelegramClient(bot, config, store);
+    search = new SearchService(config, store, crawler);
+    runtime.searchStatus = () => search!.status();
+    const bot = createBot(config, store, search), telegram = new TelegramClient(bot, config, store);
     const media = new MediaProcessor(store, telegram, runtime),
       worker = new Worker(config, store, crawler, qbit, telegram, media, runtime);
     const controller = new AbortController();
@@ -103,7 +107,8 @@ export async function main(): Promise<void> {
         onStart: () => {
           tasks.push(
             supervise(worker.run(controller.signal)),
-            supervise(crawlLoop(config, store!, crawler, runtime, controller.signal)),
+            supervise(crawlLoop(config, store!, crawler, runtime, controller.signal, search)),
+            search!.run(controller.signal),
           );
         },
       });
@@ -118,6 +123,7 @@ export async function main(): Promise<void> {
       Deno.removeSignalListener('SIGTERM', shutdown);
     }
   } finally {
+    search?.close();
     store?.close();
     lock.unlockSync();
     lock.close();

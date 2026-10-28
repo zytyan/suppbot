@@ -18,6 +18,10 @@ task-timeout-seconds = 72000
 linked-message-timeout-seconds = 300
 max-attempts = 3
 
+# Search (optional)
+search-database = "search.db"
+simple-extension = "lib/libsimple.so"
+
 [qbit]
 # 很显然，这里是qBittorrent的地址
 host = "http://localhost:8080"

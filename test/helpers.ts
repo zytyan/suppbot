@@ -14,6 +14,8 @@ export const config: Config = {
   botToken: '123:fake',
   apiRoot: 'http://127.0.0.1:1',
   database: ':memory:',
+  searchDatabase: ':memory:',
+  simpleExtension: new URL('../lib/libsimple.so', import.meta.url).pathname,
   channelId: -100123,
   groupId: -100456,
   videoChannelId: -100789,

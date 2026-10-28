@@ -5,6 +5,8 @@ import type { Article, SendRecord, Supp } from './types.ts';
 import { errorText, escapeHTML, hashes } from './types.ts';
 import { Store } from './store.ts';
 import { sleep } from './util.ts';
+import type { SearchService } from './search-service.ts';
+import { registerSearch } from './search-bot.ts';
 
 export class UncertainSendError extends Error {}
 
@@ -25,8 +27,9 @@ export interface Telegram {
   ): Promise<void>;
 }
 
-export function createBot(config: Config, store: Store): Bot {
+export function createBot(config: Config, store: Store, search?: SearchService): Bot {
   const bot = new Bot(config.botToken, { client: { apiRoot: config.apiRoot, timeoutSeconds: 7200 } });
+  if (search) registerSearch(bot, config, store, search);
   bot.on('message', (ctx) => {
     const message = ctx.message;
     const origin = message.forward_origin;

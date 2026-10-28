@@ -1,15 +1,16 @@
 # suppbot
 
-Deno + TypeScript + grammY 实现的 Telegram 自动补档机器人。负责抓取文章、下载磁链、处理视频、上传文件及提供管理后台。频道文章附带可复制的完整 magnet 链接；超出图片说明长度时以该帖回复分批发送，并记录发送进度。用户搜索功能留待后续实现。
+Deno + TypeScript + grammY 实现的 Telegram 自动补档机器人。负责抓取文章、下载磁链、处理视频、上传文件及提供管理后台。频道文章附带可复制的完整 magnet 链接；超出图片说明长度时以该帖回复分批发送，并记录发送进度。提供基于网页正文的中文、拼音全文搜索。
 
 ## 运行
 
-需要 Deno 2.9+、FFmpeg（含 ffprobe、libx264、drawtext）和 `rar`。
+需要 Deno 2.9+、FFmpeg（含 ffprobe、libx264、drawtext）和 `rar`。搜索扩展安装脚本需要 Python 3；固定发布包适用于 Linux x86_64。
 
 ```sh
 cp config/config-template.toml config/config.toml
 # 编辑 bot token、Telegram 本地 API、频道/群组和 qBittorrent 配置
 # 从仓库根目录执行所有任务
+deno task setup:simple
 deno task check
 deno task test
 deno task lint
@@ -19,7 +20,7 @@ deno task start
 
 `--check` 只读检查配置与现有 SQLite 完整性，不登录任何服务、不迁移数据库；数据库尚未创建时，直接启动即可。
 
-依赖固定在 `deno.json` 与 `deno.lock`。首次运行会缓存依赖。执行权限只允许 `ffmpeg`、`ffprobe`、`rar` 三个外部程序；文件、网络、环境变量权限用于已有配置指定的数据库、媒体路径和本地 API。测试没有网络权限，使用临时数据库和模拟 Telegram 请求。
+依赖固定在 `deno.json` 与 `deno.lock`。首次运行会缓存依赖。`deno task setup:simple` 安装并校验 simple v0.7.1 原生扩展；程序加载扩展需要 Deno 的 `--allow-ffi`，已包含在 start/test 任务中。执行权限只允许 `ffmpeg`、`ffprobe`、`rar` 三个外部程序；文件、网络、环境变量权限用于已有配置指定的数据库、媒体路径和本地 API。测试没有网络权限，使用临时数据库和模拟 Telegram 请求。
 
 沿用 `config/config.toml`。可用 `--config PATH` 或 `SUPPBOT_CONFIG` 指定其他配置；`-test` 读取旧的测试配置；`--page N`（兼容 `-page N`）选择抓取页，默认第一页。`liuli.link` 继续指定文章站点域名。
 
@@ -45,12 +46,32 @@ Telegram Bot API 必须运行在 local 模式，并与本进程共享媒体文�
 - `src/crawler.ts`、`src/qbit.ts`：抓取与下载适配器。
 - `src/telegram.ts`：grammY 更新处理、消息关联与发送。
 - `src/worker.ts`：并发限制、超时、重试、任务恢复。
+- `src/search-store.ts`、`src/search-service.ts`、`src/search-bot.ts`：FTS5 搜索库、正文索引任务、命令与分页。
 - `src/media.ts`：文件打包、视频转码、音频转换、九宫格截图。
 - `src/runtime.ts`、`src/admin.ts`：实时快照和管理页面。
 
 抓取发现的文章先入库排队，不再因并发满而丢弃。每个 worker 同时处理一个 torrent，避免单篇文章启动大量转码。临时错误按退避策略重试，达到上限后标记 error。每次尝试都有整体时限，关联群消息另有较短等待时限。退出信号贯穿下载轮询、转码、API 请求与等待；中断任务重新排队且不消耗重试次数。
 
 关联群消息先持久化，再绑定频道消息，因此支持早到、重复消息及重启恢复。已有频道消息不会因为缺少群消息而重新发帖。成功文件及因大小限制跳过的视频保持原有去重规则。后台标记为 done 是人工确认，不执行文件上传。
+
+## 网页全文搜索
+
+私聊或补档关联群发送 `/serarch 关键词`，也支持 `/search` 和群内 `/search@机器人用户名 关键词`。每页 5 条，按相关度排序，标题权重更高；结果包含命中摘要、原文链接和已有补档消息入口。“上一页／下一页”只允许发起用户在原聊天中操作，会话 30 分钟后失效。关键词上限 200 字符。
+
+搜索使用独立 `search.db`，FTS5 分词器为 [wangfenjin/simple v0.7.1](https://github.com/wangfenjin/simple/releases/tag/v0.7.1)，支持中文、拼音和英文。使用参数化 `simple_query()`，不要求用户输入 FTS 语法，不依赖外部 Jieba 词典。索引标题、正文、作者、分类和标签，排除评论、导航、广告与脚本。
+
+首次启动后台补抓补档数据库内的历史文章；新发现的文章优先索引，无磁链或补档失败的网页也可收录。单并发、每次请求完成后至少等待 2 秒，成功后每 24 小时刷新；失败退避重试并保留旧索引。进度持久化，退出后继续。补抓过程中即可使用已收录内容，不重新发布历史消息。首次全量收录至少约 25 分钟，具体取决于网页响应与失效链接。
+
+可选根配置（放在 `[qbit]` 前）：
+
+```toml
+search-database = "search.db" # 默认与补档数据库同目录
+simple-extension = "lib/libsimple.so"
+```
+
+`libsimple.so`、搜索数据库和会话不提交到 Git。安装脚本校验固定的官方 ZIP 和二进制 SHA-256，并原子替换扩展文件。Deno 的 SQLite 仅在初始化时加载配置指定的扩展，SQL `load_extension()` 保持禁用。扩展缺失、权限错误或索引初始化失败时，只关闭搜索，补档继续运行；修复后重启服务即可恢复。
+
+`/suppbot/api/runtime` 的 `search` 字段提供 `ready`、`total`、`indexed`、`pending`、`failed`、`last_indexed_at`、`last_error`。数据库包含网页正文及短期搜索会话，应按服务数据管理；丢失后可从已知文章重建。回滚只需恢复旧代码，补档主库结构与发送记录不变。
 
 ## 视频压缩
 

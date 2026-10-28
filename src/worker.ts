@@ -162,6 +162,7 @@ export async function crawlLoop(
   crawler: Crawler,
   runtime: Runtime,
   signal: AbortSignal,
+  search?: { observe(article: import('./types.ts').Article): void },
 ): Promise<void> {
   while (!signal.aborted) {
     runtime.crawlRunning = true;
@@ -171,6 +172,7 @@ export async function crawlLoop(
       for (const article of await crawler.articles(config.page, signal)) {
         signal.throwIfAborted();
         try {
+          search?.observe(article);
           const existing = store.findByPath(new URL(article.url).pathname);
           if (existing && ['done', 'error'].includes(existing.status)) continue;
           const magnets = existing && hashes(existing.magnets ?? '').length

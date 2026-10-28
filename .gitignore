@@ -18,3 +18,5 @@
 
 /*.deno.lock
 /.deno-cache/
+
+/lib/*.so

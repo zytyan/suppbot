@@ -1,4 +1,5 @@
 import type { Supp, Torrent } from './types.ts';
+import type { SearchStatus } from './search-store.ts';
 
 interface LiveTorrent {
   hash: string;
@@ -36,6 +37,7 @@ export class Runtime {
   lastCrawlError = '';
   torrentCacheAt?: string;
   torrentCacheError = '';
+  searchStatus?: () => SearchStatus;
   constructor(readonly concurrency: number) {}
   active(id: number): boolean {
     return this.running.has(id);
@@ -102,6 +104,7 @@ export class Runtime {
       last_crawl_error: this.lastCrawlError,
       torrent_cache_at: this.torrentCacheAt,
       torrent_cache_error: this.torrentCacheError,
+      search: this.searchStatus?.(),
     };
   }
 }

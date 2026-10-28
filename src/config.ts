@@ -1,10 +1,12 @@
-import { resolve } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { parse } from 'smol-toml';
 
 export interface Config {
   botToken: string;
   apiRoot: string;
   database: string;
+  searchDatabase: string;
+  simpleExtension: string;
   channelId: number;
   groupId: number;
   videoChannelId: number;
@@ -48,6 +50,14 @@ export function loadConfig(args = Deno.args, env = Deno.env.toObject()): Config 
     botToken: string(raw['bot-token'], 'bot-token'),
     apiRoot: string(raw['base-url'], 'base-url').replace(/\/$/, ''),
     database: resolve(string(raw.database, 'database')),
+    searchDatabase: resolve(
+      typeof raw['search-database'] === 'string'
+        ? raw['search-database']
+        : resolve(dirname(string(raw.database, 'database')), 'search.db'),
+    ),
+    simpleExtension: resolve(
+      typeof raw['simple-extension'] === 'string' ? raw['simple-extension'] : 'lib/libsimple.so',
+    ),
     channelId: integer(raw['channel-id'], 'channel-id'),
     groupId: integer(raw['group-id'], 'group-id'),
     videoChannelId: integer(raw['video-channel-id'], 'video-channel-id'),

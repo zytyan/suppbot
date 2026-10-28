@@ -31,6 +31,35 @@ export function parseMagnets(html: string): string[] {
   ];
 }
 
+export interface ArticleDocument extends Article {
+  body: string;
+}
+
+export function parseArticleDocument(html: string, url: string): ArticleDocument {
+  const $ = load(html);
+  $('script,style,noscript,iframe,nav,aside,#comments,.comments-area,.comment-list,.advertisement,.ads,.sharedaddy,[role="navigation"]')
+    .remove();
+  const item = $('article').first();
+  const title = item.find('h1.entry-title,h1,.entry-title').first().text().trim();
+  const content = item.find('.entry-content').first();
+  content.find('br').replaceWith('\n');
+  content.find('p,div,li,blockquote,h2,h3,h4,pre').append('\n');
+  const body = content.text().replace(/[ \t\f\v]+/g, ' ').replace(/ *\n */g, '\n').replace(/\n{3,}/g, '\n\n')
+    .trim();
+  if (!title || !body) throw new Error(`Article title or body missing: ${new URL(url).pathname}`);
+  const image = item.find('img').first().attr('src');
+  return {
+    url,
+    title,
+    body,
+    author: item.find('.author.vcard,.byline .author').first().text().trim(),
+    postTime: item.find('time').first().attr('datetime') ?? item.find('time').first().text().trim(),
+    imgUrl: image ? new URL(image, url).href : '',
+    category: item.find('.cat-links a').toArray().map((tag) => $(tag).text().trim()).join(' '),
+    tags: item.find('.tag-links a').toArray().map((tag) => $(tag).text().trim()),
+  };
+}
+
 export class Crawler {
   async host(): Promise<string> {
     try {
@@ -54,6 +83,13 @@ export class Crawler {
     const article = parseArticles(await this.html(url, signal), url)[0];
     if (!article) throw new Error(`Cannot recover article ${path}`);
     return article;
+  }
+  async document(path: string, signal: AbortSignal): Promise<ArticleDocument> {
+    if (!path.startsWith('/wp/') || path.includes('..') || path.startsWith('//')) {
+      throw new Error('Invalid article path');
+    }
+    const url = new URL(path, `https://${await this.host()}`).href;
+    return parseArticleDocument(await this.html(url, signal), url);
   }
   async magnets(url: string, signal: AbortSignal): Promise<string[]> {
     return parseMagnets(await this.html(url, signal));
