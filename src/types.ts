@@ -74,3 +74,5 @@ export const escapeHTML = (value: unknown): string =>
     /[&<>"']/g,
     (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!,
   );
+
+export class VideoRejectedError extends Error {}

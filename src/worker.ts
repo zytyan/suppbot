@@ -1,7 +1,7 @@
 import type { Config } from './config.ts';
 import type { Crawler } from './crawler.ts';
 import type { Job, Supp, Torrent, TorrentRecord } from './types.ts';
-import { errorText, hashes } from './types.ts';
+import { errorText, hashes, VideoRejectedError } from './types.ts';
 import { Store } from './store.ts';
 import { Runtime } from './runtime.ts';
 import { type Telegram, UncertainSendError } from './telegram.ts';
@@ -87,7 +87,9 @@ export class Worker {
         try {
           await this.processTorrent(supp, record, signal);
         } catch (error) {
-          if (error instanceof UncertainSendError || signal.aborted) throw error;
+          if (error instanceof UncertainSendError || error instanceof VideoRejectedError || signal.aborted) {
+            throw error;
+          }
           errors.push(error);
         }
       }
@@ -97,7 +99,9 @@ export class Worker {
       this.store.fail(
         job,
         errorText(error),
-        error instanceof UncertainSendError ? job.attempts : this.config.maxAttempts,
+        error instanceof UncertainSendError || error instanceof VideoRejectedError
+          ? job.attempts
+          : this.config.maxAttempts,
         shutdown.aborted,
       );
       console.error(`Supp #${job.supp_id}:`, errorText(error));

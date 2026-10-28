@@ -1,19 +1,82 @@
 import { basename, extname, join, relative, resolve } from 'node:path';
 import { command, naturalSort } from './util.ts';
 import type { SendRecord, Supp, Torrent, TorrentRecord } from './types.ts';
-import { errorText } from './types.ts';
+import { errorText, VideoRejectedError } from './types.ts';
 import { sendComplete, Store } from './store.ts';
 import { type Telegram, UncertainSendError } from './telegram.ts';
 import { Runtime } from './runtime.ts';
 
 export const MAX_UPLOAD_SIZE = 2_000_000_000;
-export const VIDEO_BITRATE = 8_000_000;
+export const VIDEO_BITRATE = 4_000_000;
+export const VIDEO_COMPRESSION_THRESHOLD = 4_500_000;
+export const VIDEO_SIZE_BUDGET = 1_900_000_000;
+export const MIN_VIDEO_BITRATE = 400_000;
+const CONTAINER_OVERHEAD = 1.03;
 export const AUDIO_BITRATE = 192_000;
 const videoExtensions = new Set(['.mp4', '.mkv', '.avi', '.mov']);
 const isVideo = (path: string) => videoExtensions.has(extname(path).toLowerCase());
 const stem = (path: string) => basename(path, extname(path));
-export const estimatedSize = (duration: number, audioBitrate: number): number =>
-  Math.floor((VIDEO_BITRATE + audioBitrate) * duration / 8 * 1.03);
+export const estimatedSize = (duration: number, audioBitrate: number, videoBitrate = VIDEO_BITRATE): number =>
+  Math.floor((videoBitrate + audioBitrate) * duration / 8 * CONTAINER_OVERHEAD);
+
+export function bitrateForSize(duration: number, audioBitrate: number, budget = VIDEO_SIZE_BUDGET): number {
+  const bitrate = Math.floor(budget * 8 / (duration * CONTAINER_OVERHEAD) - audioBitrate);
+  if (!Number.isFinite(bitrate) || bitrate < MIN_VIDEO_BITRATE) {
+    throw new VideoRejectedError(
+      `视频无法在 ${(budget / 1e9).toFixed(2)} GB 内保持至少 400 kbps：时长 ${
+        duration.toFixed(1)
+      } 秒，计算视频码率 ${bitrate} bps，音频 ${audioBitrate} bps`,
+    );
+  }
+  return Math.min(VIDEO_BITRATE, bitrate);
+}
+
+export interface VideoPlan {
+  full: boolean;
+  convert: boolean;
+  copyAAC: boolean;
+  duration: number;
+  audioBitrate: number;
+  videoBitrate: number;
+  maxOutputSize: number;
+  twoPass: boolean;
+}
+
+export function planVideo(info: Probe, size: number): VideoPlan {
+  const duration = Number(info.format.duration);
+  if (!Number.isFinite(duration) || duration <= 0) {
+    throw new VideoRejectedError('Missing or invalid video duration');
+  }
+  const video = info.streams.find((stream) => stream.codec_type === 'video');
+  if (!video) throw new VideoRejectedError('No video stream');
+  const audio = info.streams.find((stream) => stream.codec_type === 'audio');
+  const reportedAudio = Number(audio?.bit_rate);
+  const copyAAC = audio?.codec_name === 'aac' && Number.isFinite(reportedAudio) && reportedAudio > 0;
+  const audioBitrate = audio ? copyAAC ? reportedAudio : AUDIO_BITRATE : 0;
+  const reportedVideo = Number(video.bit_rate);
+  const sourceVideoBitrate = Number.isFinite(reportedVideo) && reportedVideo > 0 ? reportedVideo : Math.max(
+    0,
+    size * 8 / duration - (Number.isFinite(reportedAudio) && reportedAudio > 0 ? reportedAudio : 0),
+  );
+  let full = size > MAX_UPLOAD_SIZE || sourceVideoBitrate > VIDEO_COMPRESSION_THRESHOLD;
+  const convertAudio = !!audio && !copyAAC;
+  // Audio conversion may itself push a near-limit source over the upload limit.
+  if (!full && convertAudio && estimatedSize(duration, audioBitrate, sourceVideoBitrate) > MAX_UPLOAD_SIZE) {
+    full = true;
+  }
+  const twoPass = full && estimatedSize(duration, audioBitrate) > MAX_UPLOAD_SIZE;
+  return {
+    full,
+    convert: full || convertAudio,
+    copyAAC,
+    duration,
+    audioBitrate,
+    videoBitrate: twoPass ? bitrateForSize(duration, audioBitrate) : VIDEO_BITRATE,
+    maxOutputSize: twoPass ? VIDEO_SIZE_BUDGET : MAX_UPLOAD_SIZE,
+    twoPass,
+  };
+}
+
 const remove = (path: string) =>
   Deno.remove(path, { recursive: true }).catch((error) => {
     if (!(error instanceof Deno.errors.NotFound)) console.error('Temporary file cleanup:', errorText(error));
@@ -43,8 +106,13 @@ export async function transcode(
   full: boolean,
   copyAAC: boolean,
   signal: AbortSignal,
-  progress: (seconds: number) => void,
+  progress: (seconds: number, pass: number, passes: number) => void,
+  videoBitrate = VIDEO_BITRATE,
+  twoPass = false,
 ): Promise<void> {
+  if (!Number.isFinite(videoBitrate) || videoBitrate < MIN_VIDEO_BITRATE) {
+    throw new VideoRejectedError('Video bitrate below 400 kbps');
+  }
   const args = ['-y', '-v', 'error', '-i', input, '-map', '0:v:0', '-map', '0:a:0?'];
   args.push(
     ...(full
@@ -54,29 +122,73 @@ export async function transcode(
         '-preset',
         'medium',
         '-b:v',
-        '8000000',
+        String(videoBitrate),
         '-maxrate',
-        '8000000',
+        String(videoBitrate),
         '-bufsize',
-        '16000000',
+        String(videoBitrate * 2),
         '-pix_fmt',
         'yuv420p',
       ]
       : ['-c:v', 'copy']),
   );
-  args.push(...(copyAAC ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', '192000']));
-  let pending = '';
-  await command(
-    'ffmpeg',
-    [...args, '-movflags', '+faststart', '-progress', 'pipe:1', '-nostats', output],
-    signal,
-    (chunk) => {
-      pending += chunk;
-      const lines = pending.split('\n');
-      pending = lines.pop() ?? '';
-      for (const line of lines) if (line.startsWith('out_time_us=')) progress(Number(line.slice(12)) / 1e6);
-    },
-  );
+  const passes = full && twoPass ? 2 : 1;
+  for (let pass = 1; pass <= passes; pass++) {
+    const passArgs = [...args];
+    if (passes === 2) passArgs.push('-pass', String(pass), '-passlogfile', output + '.pass');
+    if (passes === 2 && pass === 1) passArgs.push('-an', '-f', 'null');
+    else {
+      passArgs.push(
+        ...(copyAAC ? ['-c:a', 'copy'] : ['-c:a', 'aac', '-b:a', String(AUDIO_BITRATE)]),
+        '-movflags',
+        '+faststart',
+      );
+    }
+    let pending = '';
+    await command(
+      'ffmpeg',
+      [...passArgs, '-progress', 'pipe:1', '-nostats', passes === 2 && pass === 1 ? '/dev/null' : output],
+      signal,
+      (chunk) => {
+        pending += chunk;
+        const lines = pending.split('\n');
+        pending = lines.pop() ?? '';
+        for (const line of lines) {
+          if (line.startsWith('out_time_us=')) {
+            progress(Number(line.slice(12)) / 1e6, pass, passes);
+          }
+        }
+      },
+    );
+  }
+}
+
+// Recheck the real output before any Telegram side effect; bitrate estimates are not hard size guarantees.
+export async function encodeVideoWithinLimit(
+  input: string,
+  output: string,
+  plan: VideoPlan,
+  signal: AbortSignal,
+  progress: (seconds: number, pass: number, passes: number) => void,
+  encode = transcode,
+): Promise<void> {
+  let bitrate = plan.videoBitrate, budget = plan.maxOutputSize;
+  let full = plan.full, twoPass = plan.twoPass;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    signal.throwIfAborted();
+    await encode(input, output, full, plan.copyAAC, signal, progress, bitrate, twoPass);
+    const size = (await Deno.stat(output)).size;
+    if (size <= budget) return;
+    budget = VIDEO_SIZE_BUDGET;
+    const fitting = bitrateForSize(plan.duration, plan.audioBitrate, budget);
+    bitrate = Math.min(fitting, Math.floor(bitrate * budget / size * 0.98));
+    if (bitrate < MIN_VIDEO_BITRATE) {
+      throw new VideoRejectedError(`视频实际大小超限，重压所需视频码率 ${bitrate} bps 低于 400 kbps`);
+    }
+    full = true;
+    twoPass = true;
+  }
+  throw new VideoRejectedError('视频经过重压后仍超过 1.90 GB，放弃上传');
 }
 
 export async function screenshots(
@@ -190,7 +302,9 @@ export class MediaProcessor {
           signal,
         );
       } catch (error) {
-        if (error instanceof UncertainSendError || signal.aborted) throw error;
+        if (error instanceof UncertainSendError || error instanceof VideoRejectedError || signal.aborted) {
+          throw error;
+        }
         errors.push(error);
       }
     }
@@ -198,7 +312,9 @@ export class MediaProcessor {
     try {
       await this.raw(root, files, supp, record, signal);
     } catch (error) {
-      if (error instanceof UncertainSendError || signal.aborted) throw error;
+      if (error instanceof UncertainSendError || error instanceof VideoRejectedError || signal.aborted) {
+        throw error;
+      }
       errors.push(error);
     }
     if (errors.length) throw new Error(errors.map(errorText).join('\n'));
@@ -210,16 +326,30 @@ export class MediaProcessor {
     torrent: TorrentRecord,
     signal: AbortSignal,
   ): Promise<void> {
+    const previous = this.store.all<SendRecord>(
+      "SELECT * FROM send_records WHERE torrent_id=? AND source_path=? AND send_type='video' AND deleted_at IS NULL",
+      torrent.id,
+      sourcePath,
+    );
+    if (previous.some(sendComplete)) return;
+    if (previous.some((record) => ['sending', 'uncertain'].includes(record.status))) {
+      throw new UncertainSendError(
+        `Video ${sourcePath} requires reconciliation before applying the new compression policy`,
+      );
+    }
     let info = await probe(path, signal);
     let video = info.streams.find((s) => s.codec_type === 'video');
     if (!video) throw new Error(`No video stream: ${path}`);
-    const audio = info.streams.find((s) => s.codec_type === 'audio');
-    const copyAAC = audio?.codec_name === 'aac' && Number(audio.bit_rate) > 0;
-    const audioRate = audio ? copyAAC ? Number(audio.bit_rate) : AUDIO_BITRATE : 0;
     const size = (await Deno.stat(path)).size;
-    const full = size > MAX_UPLOAD_SIZE || Number(video.bit_rate) > 12_000_000;
-    const convert = full || (!!audio && !copyAAC);
-    const name = convert ? `${stem(path)}.mp4` : basename(path);
+    let plan: VideoPlan;
+    try {
+      plan = planVideo(info, size);
+    } catch (error) {
+      const record = this.store.prepareSend(torrent.id, sourcePath, 'video', `${stem(path)}.mp4`);
+      this.failRecord(record, error);
+      throw error;
+    }
+    const name = plan.convert ? `${stem(path)}.mp4` : basename(path);
     const record = this.store.prepareSend(torrent.id, sourcePath, 'video', name);
     if (sendComplete(record)) return;
     if (['sending', 'uncertain'].includes(record.status)) {
@@ -227,29 +357,25 @@ export class MediaProcessor {
     }
     const dir = await Deno.makeTempDir({ prefix: 'suppbot-video-' });
     try {
-      let duration = Number(info.format.duration);
-      if (!(duration > 0)) throw new Error('Missing video duration');
-      if (full && estimatedSize(duration, audioRate) > MAX_UPLOAD_SIZE) {
-        return this.skip(record, 'Estimated transcoded size exceeds limit');
-      }
+      let duration = plan.duration;
       let output = path;
-      if (convert) {
+      if (plan.convert) {
         output = join(dir, name);
-        this.runtime.torrent(supp.id, torrent.hash, full ? '视频转码' : '音频转换', { progress: 0 });
-        await transcode(
+        const phase = plan.full ? '视频转码' : '音频转换';
+        this.runtime.torrent(supp.id, torrent.hash, phase, { progress: 0 });
+        console.log(
+          `Video ${sourcePath}: target ${plan.videoBitrate} bps, size limit ${plan.maxOutputSize} bytes, two-pass ${plan.twoPass}`,
+        );
+        await encodeVideoWithinLimit(
           path,
           output,
-          full,
-          copyAAC,
+          plan,
           signal,
-          (seconds) =>
-            this.runtime.torrent(supp.id, torrent.hash, full ? '视频转码' : '音频转换', {
-              progress: Math.min(1, seconds / duration),
+          (seconds, pass, passes) =>
+            this.runtime.torrent(supp.id, torrent.hash, phase, {
+              progress: Math.min(1, ((pass - 1) + Math.max(0, seconds / duration)) / passes),
             }),
         );
-        if ((await Deno.stat(output)).size > MAX_UPLOAD_SIZE) {
-          return this.skip(record, 'Actual transcoded size exceeds limit');
-        }
         info = await probe(output, signal);
         video = info.streams.find((s) => s.codec_type === 'video');
         duration = Number(info.format.duration);
@@ -280,9 +406,6 @@ export class MediaProcessor {
     } finally {
       await remove(dir);
     }
-  }
-  private skip(record: SendRecord, reason: string): void {
-    this.store.updateSend(record.id, { status: 'skipped_too_large', error: reason });
   }
   private failRecord(record: SendRecord, error: unknown): void {
     const current = this.store.one<SendRecord>('SELECT * FROM send_records WHERE id=?', record.id);
@@ -341,7 +464,9 @@ export class MediaProcessor {
           );
         } catch (error) {
           this.failRecord(record, error);
-          if (error instanceof UncertainSendError || signal.aborted) throw error;
+          if (error instanceof UncertainSendError || error instanceof VideoRejectedError || signal.aborted) {
+            throw error;
+          }
           errors.push(error);
         }
       }

@@ -5,7 +5,7 @@ import { Crawler } from '../src/crawler.ts';
 import { Runtime } from '../src/runtime.ts';
 import type { Telegram } from '../src/telegram.ts';
 import { UncertainSendError } from '../src/telegram.ts';
-import type { Torrent } from '../src/types.ts';
+import { type Torrent, VideoRejectedError } from '../src/types.ts';
 import { article, config } from './helpers.ts';
 
 const torrent: Torrent = {
@@ -164,5 +164,18 @@ Deno.test('scheduler bounds concurrent work and keeps all interrupted jobs queue
     clearTimeout(deadline);
     shutdown.abort();
     store.close();
+  }
+});
+
+Deno.test('a video below the fitting minimum bitrate fails immediately without automatic retries', async () => {
+  const t = setup({ fail: new VideoRejectedError('视频无法在 1.90 GB 内保持至少 400 kbps') });
+  try {
+    await t.worker.execute(t.store.claim()!, new AbortController().signal);
+    equal(t.store.supp(t.supp.id).status, 'error');
+    equal(t.store.torrents(t.supp.id)[0]!.status, 'error');
+    equal(t.store.claim(Date.now() + 10_000_000), undefined);
+    ok(t.store.torrents(t.supp.id)[0]!.error.includes('400 kbps'));
+  } finally {
+    t.store.close();
   }
 });
