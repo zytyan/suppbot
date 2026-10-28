@@ -387,6 +387,10 @@ func telegramURL(chatID, messageID int64) string {
 	if messageID <= 0 {
 		return ""
 	}
+	var identity ChatIdentity
+	if db != nil && db.Where("chat_id = ?", chatID).First(&identity).Error == nil && identity.Username != "" {
+		return "https://t.me/" + url.PathEscape(strings.TrimPrefix(identity.Username, "@")) + "/" + strconv.FormatInt(messageID, 10)
+	}
 	chat := strconv.FormatInt(chatID, 10)
 	chat = strings.TrimPrefix(chat, "-100")
 	if chat == "" || strings.HasPrefix(chat, "-") {

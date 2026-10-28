@@ -67,9 +67,10 @@ type SendRecord struct {
 }
 
 func migrateSendRecords() error {
-	if err := db.AutoMigrate(&Supp{}, &SuppTorrent{}, &SendRecord{}); err != nil {
+	if err := db.AutoMigrate(&Supp{}, &SuppTorrent{}, &SendRecord{}, &ChatIdentity{}); err != nil {
 		return err
 	}
+	seedKnownChatIdentities()
 	var supps []Supp
 	if err := db.Find(&supps).Error; err != nil {
 		return err

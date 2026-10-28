@@ -30,6 +30,14 @@ func TestAdminAssetsAreEmbedded(t *testing.T) {
 	}
 }
 
+func TestTelegramURLForPrivateChannel(t *testing.T) {
+	originalDB := db
+	db = nil
+	t.Cleanup(func() { db = originalDB })
+
+	require.Equal(t, "https://t.me/c/314159265/42", telegramURL(-100314159265, 42))
+}
+
 func TestAdminDashboardRendersEmbeddedPage(t *testing.T) {
 	originalDB := db
 	t.Cleanup(func() { db = originalDB })

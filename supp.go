@@ -192,6 +192,7 @@ func sendSuppMsg(article *crawler.Article, supp *Supp) error {
 		log.Println(err)
 		return err
 	}
+	saveChatIdentity(&msg.Chat)
 	key := Msg{ChatId: msg.Chat.Id, Id: msg.MessageId}
 	supp.ChannelMsg = key
 	supp.Status = "running"
@@ -324,6 +325,7 @@ func OnLinkedGroupMsg(_ *gotgbot.Bot, ctx *ext.Context) error {
 	cid := msg.ForwardOrigin.MergeMessageOrigin().Chat.Id
 	mid := msg.ForwardOrigin.MergeMessageOrigin().MessageId
 	key := Msg{ChatId: cid, Id: mid}
+	saveChatIdentity(&msg.Chat)
 	supp, ok := runningSupp.GetByMsg(key)
 	log.Printf("get linked group msg, channel id: %d, channel msg id: %d, group id: %d, group msg id: %d", cid, mid, msg.Chat.Id, msg.MessageId)
 	if !ok {

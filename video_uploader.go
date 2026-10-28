@@ -215,6 +215,7 @@ func uploadOneVideo(video, sourcePath string, supp *Supp, torrentRecord *SuppTor
 		if sendErr != nil {
 			return failVideoRecord(record, sendErr)
 		}
+		saveChatIdentity(&groupMsg.Chat)
 		record.GroupChatID, record.GroupMessageID = groupMsg.Chat.Id, groupMsg.MessageId
 		if err := db.Save(record).Error; err != nil {
 			return err
@@ -234,13 +235,14 @@ func uploadOneVideo(video, sourcePath string, supp *Supp, torrentRecord *SuppTor
 	if videoMsg.Video == nil {
 		return failVideoRecord(record, errors.New("telegram response has no video"))
 	}
+	saveChatIdentity(&videoMsg.Chat)
 	record.Status, record.Error = SendStatusSuccess, ""
 	record.FileID, record.FileUniqueID = videoMsg.Video.FileId, videoMsg.Video.FileUniqueId
 	record.ChannelChatID, record.ChannelMessageID = videoMsg.Chat.Id, videoMsg.MessageId
 	if err := db.Save(record).Error; err != nil {
 		return err
 	}
-	link := html.EscapeString(fmt.Sprintf("https://t.me/%s/%d", videoMsg.Chat.Username, videoMsg.MessageId))
+	link := html.EscapeString(telegramURL(videoMsg.Chat.Id, videoMsg.MessageId))
 	text := fmt.Sprintf(`<a href="%s">%s</a>`, link, html.EscapeString(filepath.Base(sendVideo)))
 	if _, _, editErr := bot.EditMessageCaption(&gotgbot.EditMessageCaptionOpts{ChatId: record.GroupChatID, MessageId: record.GroupMessageID, Caption: text, ParseMode: gotgbot.ParseModeHTML}); editErr != nil {
 		log.Printf("edit video link caption failed: %s", editErr)

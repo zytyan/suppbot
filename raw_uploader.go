@@ -113,6 +113,7 @@ func uploadFile(supp *Supp, torrent *SuppTorrent, record *SendRecord, file, capt
 			if msg.Document == nil {
 				err = errors.New("telegram response has no document")
 			} else {
+				saveChatIdentity(&msg.Chat)
 				record.Status = SendStatusSuccess
 				record.Error = ""
 				record.FileID = msg.Document.FileId
