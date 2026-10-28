@@ -1,7 +1,8 @@
 import { equal, ok, rejects } from 'node:assert/strict';
 import { Bot } from 'grammy';
+import { load } from 'cheerio';
 import { Store } from '../src/store.ts';
-import { createBot, TelegramClient, UncertainSendError } from '../src/telegram.ts';
+import { createBot, formatArticlePost, TelegramClient, UncertainSendError } from '../src/telegram.ts';
 import { article, config } from './helpers.ts';
 
 Deno.test('unknown send outcome is persisted and never automatically resent', async () => {
@@ -107,6 +108,112 @@ Deno.test('grammY update handler accepts only configured linked group and tolera
       message: { ...update.message, chat: { ...update.message.chat, id: -100999 } },
     });
     equal(store.all('SELECT * FROM suppbot_forwards').length, 1);
+  } finally {
+    store.close();
+  }
+});
+
+Deno.test('article post includes all normalized magnet links as copyable code in its photo caption', async () => {
+  const store = new Store(':memory:');
+  const first = 'a'.repeat(40), second = 'b'.repeat(40);
+  try {
+    const supp = store.enqueue({ ...article, title: 'Title <&>' }, [first.toUpperCase(), first, second]);
+    const bot = new Bot(config.botToken);
+    let calls = 0;
+    bot.api.config.use((prev, method, payload) => {
+      calls++;
+      equal(method, 'sendPhoto');
+      ok('caption' in payload);
+      const $ = load(payload.caption!);
+      equal($('code').length, 2);
+      equal($('code').eq(0).text(), `magnet:?xt=urn:btih:${first}`);
+      equal($('code').eq(1).text(), `magnet:?xt=urn:btih:${second}`);
+      ok($.text().includes('Title <&>'));
+      ok($.text().length <= 1024);
+      return Promise.resolve({
+        ok: true,
+        result: {
+          message_id: 42,
+          date: 1,
+          chat: { id: config.channelId, type: 'channel', title: 'channel' },
+        },
+      }) as ReturnType<typeof prev>;
+    });
+    const client = new TelegramClient(bot, config, store), signal = new AbortController().signal;
+    await client.publish(supp, { ...article, title: 'Title <&>' }, signal);
+    await client.pendingMagnets(store.supp(supp.id), signal);
+    await client.publish(store.supp(supp.id), article, signal);
+    equal(calls, 1);
+    equal(store.supp(supp.id).channel_id, 42);
+  } finally {
+    store.close();
+  }
+});
+
+Deno.test('long magnet lists split at message limits without dropping links or breaking HTML', () => {
+  const links = Array.from({ length: 80 }, (_, index) => index.toString(16).padStart(40, '0'));
+  const post = formatArticlePost({ magnets: links.join(',') } as import('../src/types.ts').Supp, {
+    ...article,
+    title: '<标题>'.repeat(1000),
+    tags: ['long'.repeat(2000)],
+  });
+  ok(load(post.caption).text().length <= 1024);
+  ok(post.followups.length > 1);
+  const actual = post.followups.flatMap((text) => {
+    const $ = load(text);
+    ok($.text().length <= 4096);
+    return $('code').toArray().map((element) => $(element).text());
+  });
+  equal(actual.length, 80);
+  for (const [index, link] of links.entries()) equal(actual[index], `magnet:?xt=urn:btih:${link}`);
+});
+
+Deno.test('retries only unsent magnet replies and never reposts the article photo', async () => {
+  const store = new Store(':memory:');
+  try {
+    const links = Array.from({ length: 80 }, (_, index) => index.toString(16).padStart(40, '0'));
+    const supp = store.enqueue(article, links), bot = new Bot(config.botToken);
+    let photos = 0, replies = 0;
+    bot.api.config.use((prev, method, payload) => {
+      if (method === 'sendPhoto') {
+        photos++;
+        return Promise.resolve({
+          ok: true,
+          result: {
+            message_id: 42,
+            date: 1,
+            chat: { id: config.channelId, type: 'channel', title: 'channel' },
+          },
+        }) as ReturnType<typeof prev>;
+      }
+      equal(method, 'sendMessage');
+      ok('reply_parameters' in payload);
+      equal(payload.reply_parameters?.message_id, 42);
+      replies++;
+      if (replies === 2) {
+        return Promise.resolve({
+          ok: false,
+          error_code: 400,
+          description: 'Bad Request: temporary test rejection',
+        }) as ReturnType<typeof prev>;
+      }
+      return Promise.resolve({
+        ok: true,
+        result: {
+          message_id: 100 + replies,
+          date: 1,
+          chat: { id: config.channelId, type: 'channel', title: 'channel' },
+        },
+      }) as ReturnType<typeof prev>;
+    });
+    const client = new TelegramClient(bot, config, store), signal = new AbortController().signal;
+    await client.publish(supp, article, signal);
+    await rejects(() => client.pendingMagnets(store.supp(supp.id), signal), /Bad Request/);
+    await client.publish(store.supp(supp.id), article, signal);
+    await client.pendingMagnets(store.supp(supp.id), signal);
+    await client.pendingMagnets(store.supp(supp.id), signal);
+    equal(photos, 1);
+    equal(replies, 3);
   } finally {
     store.close();
   }

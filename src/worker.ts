@@ -71,6 +71,7 @@ export class Worker {
           : await this.crawler.article(supp.article_url_path, signal);
         await this.telegram.publish(supp, article, signal);
       }
+      await this.telegram.pendingMagnets?.(this.store.supp(supp.id), signal);
       this.runtime.phase(supp.id, '添加 torrent');
       await this.qbit.add(hashes(supp.magnets), signal);
       this.runtime.phase(supp.id, '等待关联群消息');

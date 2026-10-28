@@ -2,13 +2,14 @@ import { pathToFileURL } from 'node:url';
 import { Bot, GrammyError, InputFile } from 'grammy';
 import type { Config } from './config.ts';
 import type { Article, SendRecord, Supp } from './types.ts';
-import { errorText, escapeHTML } from './types.ts';
+import { errorText, escapeHTML, hashes } from './types.ts';
 import { Store } from './store.ts';
 import { sleep } from './util.ts';
 
 export class UncertainSendError extends Error {}
 
 export interface Telegram {
+  pendingMagnets?(supp: Supp, signal: AbortSignal): Promise<void>;
   publish(supp: Supp, article: Article, signal: AbortSignal): Promise<void>;
   document(supp: Supp, record: SendRecord, path: string, caption: string, signal: AbortSignal): Promise<void>;
   screenshot(supp: Supp, record: SendRecord, path: string, name: string, signal: AbortSignal): Promise<void>;
@@ -39,6 +40,52 @@ export function createBot(config: Config, store: Store): Bot {
   });
   bot.catch((error) => console.error('Telegram update failed:', errorText(error.error)));
   return bot;
+}
+
+const clip = (value: string, max: number): string =>
+  value.length <= max ? value : max < 1 ? '' : value.slice(0, max - 1).replace(/[\uD800-\uDBFF]$/, '') + '…';
+
+function articleCaption(article: Article, limit: number): { html: string; length: number } {
+  const id = '#wp' + (new URL(article.url).pathname.split('/').pop()?.split('.')[0] ?? '');
+  let title = article.title;
+  let metadata = `由 ${article.author} 发表于 ${article.postTime}\n分类：${article.category}\n标签：${
+    article.tags.map((t) => '#' + t).join(' ')
+  }`;
+  if (title.length + metadata.length + id.length + 2 > limit) {
+    title = clip(title, Math.max(1, Math.min(512, limit - id.length - 2)));
+    metadata = clip(metadata, Math.max(0, limit - title.length - id.length - 2));
+  }
+  return {
+    html: `<a href="${escapeHTML(article.url)}">${escapeHTML(title)}</a>\n${escapeHTML(metadata)}\n${
+      escapeHTML(id)
+    }`,
+    length: title.length + metadata.length + id.length + 2,
+  };
+}
+
+export function formatArticlePost(supp: Supp, article: Article): { caption: string; followups: string[] } {
+  const links = hashes(supp.magnets ?? '').map((hash) => `magnet:?xt=urn:btih:${hash}`);
+  const base = articleCaption(article, 1024);
+  if (!links.length) return { caption: base.html, followups: [] };
+  const heading = '磁力链接：\n';
+  const block = heading + links.map((link) => `<code>${escapeHTML(link)}</code>`).join('\n');
+  if (base.length + 2 + heading.length + links.join('\n').length <= 1024) {
+    return { caption: base.html + '\n\n' + block, followups: [] };
+  }
+  const followups: string[] = [];
+  let lines: string[] = [], length = heading.length;
+  for (const link of links) {
+    if (length + link.length + 1 > 4096 && lines.length) {
+      followups.push(heading + lines.join('\n'));
+      lines = [];
+      length = heading.length;
+    }
+    lines.push(`<code>${escapeHTML(link)}</code>`);
+    length += link.length + 1;
+  }
+  if (lines.length) followups.push(heading + lines.join('\n'));
+  const note = '\n\n磁力链接见本帖回复。';
+  return { caption: articleCaption(article, 1024 - note.length).html + note, followups };
 }
 
 export class TelegramClient implements Telegram {
@@ -82,11 +129,8 @@ export class TelegramClient implements Telegram {
     if (['sending', 'uncertain'].includes(this.store.meta(key) ?? '')) {
       throw new UncertainSendError(`Channel post for supp #${supp.id} requires reconciliation`);
     }
-    const text = `<a href="${escapeHTML(article.url)}">${escapeHTML(article.title)}</a>\n由 ${
-      escapeHTML(article.author)
-    } 发表于 ${escapeHTML(article.postTime)}\n分类：${escapeHTML(article.category)}\n标签：${
-      escapeHTML(article.tags.map((t) => '#' + t).join(' '))
-    }\n#wp${new URL(article.url).pathname.split('/').pop()?.split('.')[0] ?? ''}`;
+    const post = formatArticlePost(supp, article);
+    const text = post.caption;
     // Download before marking the remote side effect as in flight.
     let photo = new InputFile('no_image.png');
     if (article.imgUrl) {
@@ -101,6 +145,8 @@ export class TelegramClient implements Telegram {
         signal.throwIfAborted();
       }
     }
+    signal.throwIfAborted();
+    this.store.setMeta(`channel-magnets:${supp.id}`, JSON.stringify(post.followups));
     this.store.setMeta(key, 'sending');
     let message;
     try {
@@ -120,6 +166,37 @@ export class TelegramClient implements Telegram {
       this.store.setMeta(key, 'sent');
     });
     this.store.chat(message.chat);
+  }
+  async pendingMagnets(supp: Supp, signal: AbortSignal): Promise<void> {
+    const plan = this.store.meta(`channel-magnets:${supp.id}`);
+    if (!plan) return;
+    const messages = JSON.parse(plan) as string[];
+    for (const [index, text] of messages.entries()) {
+      const key = `channel-magnet-send:${supp.id}:${index}`;
+      const state = this.store.meta(key);
+      if (state === 'sent') continue;
+      if (state === 'sending' || state === 'uncertain') {
+        throw new UncertainSendError(
+          `Magnet reply #${index + 1} for supp #${supp.id} requires reconciliation`,
+        );
+      }
+      signal.throwIfAborted();
+      this.store.setMeta(key, 'sending');
+      try {
+        await this.send(() =>
+          this.bot.api.sendMessage(supp.channel_chat_id, text, {
+            parse_mode: 'HTML',
+            reply_parameters: { message_id: supp.channel_id },
+            link_preview_options: { is_disabled: true },
+          }, signal), signal);
+      } catch (error) {
+        const uncertain = !(error instanceof GrammyError) || error.error_code >= 500;
+        this.store.setMeta(key, uncertain ? 'uncertain' : 'failed');
+        if (uncertain) throw new UncertainSendError(`Magnet reply outcome unknown for supp #${supp.id}`);
+        throw error;
+      }
+      this.store.setMeta(key, 'sent');
+    }
   }
   async document(
     supp: Supp,

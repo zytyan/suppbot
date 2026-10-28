@@ -24,8 +24,12 @@ function setup(options: { group?: boolean; fail?: Error; stall?: boolean } = {})
   const store = new Store(':memory:'), runtime = new Runtime(2), supp = store.enqueue(article, ['abc']);
   store.saveChannel(supp.id, config.channelId, 10);
   if (options.group !== false) store.saveForward(config.channelId, 10, config.groupId, 20);
-  let published = 0, processed = 0;
+  let published = 0, processed = 0, pending = 0;
   const telegram: Telegram = {
+    pendingMagnets: () => {
+      pending++;
+      return Promise.resolve();
+    },
     publish: () => {
       published++;
       return Promise.resolve();
@@ -45,7 +49,15 @@ function setup(options: { group?: boolean; fail?: Error; stall?: boolean } = {})
     },
   };
   const worker = new Worker(config, store, new Crawler(), qbit, telegram, media, runtime);
-  return { store, runtime, supp, worker, published: () => published, processed: () => processed };
+  return {
+    store,
+    runtime,
+    supp,
+    worker,
+    published: () => published,
+    pending: () => pending,
+    processed: () => processed,
+  };
 }
 Deno.test('worker resumes existing channel post and completes torrent without republishing', async () => {
   const t = setup();
@@ -53,6 +65,7 @@ Deno.test('worker resumes existing channel post and completes torrent without re
     await t.worker.execute(t.store.claim()!, new AbortController().signal);
     equal(t.store.supp(t.supp.id).status, 'done');
     equal(t.published(), 0);
+    equal(t.pending(), 1);
     equal(t.processed(), 1);
     equal(t.store.torrents(t.supp.id)[0]!.status, 'done');
     equal(t.runtime.snapshot().running.length, 0);
