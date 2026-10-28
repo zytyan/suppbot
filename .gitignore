@@ -11,3 +11,10 @@
 /liuli.link
 /.agents/
 /.codex/
+/node_modules/
+/dist/
+/*.db-wal
+/*.db-shm
+
+/*.deno.lock
+/.deno-cache/

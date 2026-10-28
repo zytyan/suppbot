@@ -1,0 +1,18 @@
+{
+  "imports": {
+    "grammy": "https://deno.land/x/grammy@v1.38.2/mod.ts",
+    "cheerio": "npm:cheerio@1.1.2",
+    "smol-toml": "npm:smol-toml@1.4.2"
+  },
+  "tasks": {
+    "start": "deno run --frozen --allow-import=deno.land,cdn.skypack.dev,jsr.io --allow-read --allow-write --allow-net --allow-env --allow-run=ffmpeg,ffprobe,rar src/main.ts",
+    "dev": "deno task start",
+    "check": "deno check --allow-import=deno.land,cdn.skypack.dev,jsr.io src/main.ts test/*.test.ts",
+    "test": "deno test --allow-import=deno.land,cdn.skypack.dev,jsr.io --allow-read --allow-write --allow-run=ffmpeg,ffprobe,rar test/",
+    "lint": "deno lint src test",
+    "fmt": "deno fmt src test deno.json"
+  },
+  "compilerOptions": { "strict": true, "noUncheckedIndexedAccess": true },
+  "fmt": { "lineWidth": 110, "singleQuote": true },
+  "exclude": ["test/fixtures"]
+}

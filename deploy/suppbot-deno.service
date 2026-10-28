@@ -1,0 +1,22 @@
+[Unit]
+Description=Suppbot (Deno + grammY)
+After=network.target telegram-bot-api.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=tgbotapi
+Group=tgbots
+WorkingDirectory=/opt/tgbots/suppbot
+Environment=TZ=Asia/Shanghai
+Environment=DENO_DIR=/opt/tgbots/suppbot/.deno-cache
+ExecStart=/usr/local/bin/deno task start
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGINT
+TimeoutStopSec=45s
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

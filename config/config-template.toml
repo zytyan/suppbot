@@ -11,6 +11,13 @@ admin-id = 2718281828
 tph-access-token = "" # 这里原来是给telegra.ph使用的，现在因为不能上传图片了，暂且搁置
 database = "data.db" # 数据库名称，不用动
 
+# Deno worker settings (optional)
+max-concurrent = 2
+crawl-interval-seconds = 7200
+task-timeout-seconds = 72000
+linked-message-timeout-seconds = 300
+max-attempts = 3
+
 [qbit]
 # 很显然，这里是qBittorrent的地址
 host = "http://localhost:8080"
