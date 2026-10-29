@@ -4,6 +4,7 @@ import { BOT_COMMANDS, syncBotCommands } from '../src/bot-commands.ts';
 import { config } from './helpers.ts';
 
 Deno.test('Telegram command registration scopes search commands to private chats and the linked group', async () => {
+  deepEqual(BOT_COMMANDS.map((command) => command.command), ['search']);
   const bot = new Bot(config.botToken), calls: { method: string; payload: unknown }[] = [];
   bot.api.config.use((prev, method, payload) => {
     calls.push({ method, payload });

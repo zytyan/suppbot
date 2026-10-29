@@ -4,8 +4,7 @@ import { sleep } from './util.ts';
 
 // Handlers and Telegram's command menu share the same command definitions.
 export const SEARCH_COMMANDS = [
-  { command: 'serarch', description: '搜索网页内容（支持中文和拼音）' },
-  { command: 'search', description: '搜索网页内容（同 /serarch）' },
+  { command: 'search', description: '搜索网页内容（支持中文和拼音）' },
 ] as const;
 export const BOT_COMMANDS = [...SEARCH_COMMANDS];
 

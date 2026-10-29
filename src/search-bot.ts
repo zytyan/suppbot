@@ -1,4 +1,4 @@
-import { Bot, GrammyError, InlineKeyboard } from 'grammy';
+import { Bot, type Context, GrammyError, InlineKeyboard } from 'grammy';
 import type { Config } from './config.ts';
 import { errorText, escapeHTML as e } from './types.ts';
 import { Store } from './store.ts';
@@ -34,11 +34,12 @@ function buttons(id: string, result: SearchPage): InlineKeyboard {
 export function registerSearch(bot: Bot, config: Config, legacy: Store, search: SearchService): void {
   const allowed = (chat: { id: number; type: string } | undefined) =>
     chat?.type === 'private' || chat?.id === config.groupId;
-  bot.command(SEARCH_COMMANDS.map((command) => command.command), async (ctx) => {
-    if (!allowed(ctx.chat) || !ctx.from) return;
-    const query = ctx.match.trim();
+  const runSearch = async (ctx: Context, text: string): Promise<void> => {
+    const chat = ctx.chat, user = ctx.from;
+    if (!chat || !user || !allowed(chat)) return;
+    const query = text.trim();
     if (!query) {
-      await ctx.reply('用法：/serarch 关键词\n也支持 /search 关键词。');
+      await ctx.reply('用法：/search 关键词\n私聊也可以直接发送关键词搜索。');
       return;
     }
     if (query.length > 200) {
@@ -55,7 +56,7 @@ export function registerSearch(bot: Bot, config: Config, legacy: Store, search: 
       return;
     }
     try {
-      const result = index.search(query), session = index.createSession(query, ctx.from.id, ctx.chat.id);
+      const result = index.search(query), session = index.createSession(query, user.id, chat.id);
       let text = renderSearchResults(query, result, legacy);
       if (status.pending) text += `\n\n网页索引进行中：已收录 ${status.indexed}/${status.total} 篇。`;
       await ctx.reply(text, {
@@ -67,6 +68,14 @@ export function registerSearch(bot: Bot, config: Config, legacy: Store, search: 
       console.error('Search query failed:', errorText(error));
       await ctx.reply('搜索失败，请稍后重试或换一组关键词。');
     }
+  };
+  bot.command(SEARCH_COMMANDS.map((command) => command.command), (ctx) => runSearch(ctx, ctx.match));
+  bot.on('message:text', async (ctx, next) => {
+    if (ctx.chat.type !== 'private') return next();
+    const text = ctx.message.text.trim();
+    // Keep removed or unknown slash commands out of the plain-text search path.
+    if (text.startsWith('/')) return next();
+    if (text) await runSearch(ctx, text);
   });
   bot.callbackQuery(/^ss:([a-f0-9]{24}):(\d+)$/, async (ctx) => {
     if (!allowed(ctx.chat)) {
@@ -80,11 +89,11 @@ export function registerSearch(bot: Bot, config: Config, legacy: Store, search: 
     }
     const session = index.session(ctx.match[1]!);
     if (!session) {
-      await ctx.answerCallbackQuery({ text: '搜索已过期，请重新使用 /serarch 搜索。' });
+      await ctx.answerCallbackQuery({ text: '搜索已过期，请重新使用 /search 搜索。' });
       return;
     }
     if (session.owner_id !== ctx.from.id || session.chat_id !== ctx.chat!.id) {
-      await ctx.answerCallbackQuery({ text: '请使用 /serarch 发起自己的搜索。', show_alert: true });
+      await ctx.answerCallbackQuery({ text: '请使用 /search 发起自己的搜索。', show_alert: true });
       return;
     }
     await ctx.answerCallbackQuery();
@@ -100,7 +109,7 @@ export function registerSearch(bot: Bot, config: Config, legacy: Store, search: 
         error instanceof GrammyError && error.description.toLowerCase().includes('message is not modified')
       ) return;
       console.error('Search pagination failed:', errorText(error));
-      await ctx.reply('翻页失败，请重新使用 /serarch 搜索。');
+      await ctx.reply('翻页失败，请重新使用 /search 搜索。');
     }
   });
 }

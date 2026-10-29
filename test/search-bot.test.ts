@@ -23,6 +23,10 @@ const command = (text: string, chatId = 1, owner = 1): Update => ({
     entities: [{ type: 'bot_command', offset: 0, length: text.split(' ')[0]!.length }],
   },
 });
+const textMessage = (text: string, chatId = 1, owner = 1): Update => ({
+  update_id: 4,
+  message: { message_id: 2, date: 1, from: user(owner), chat: chat(chatId), text },
+});
 const callback = (data: string, chatId = 1, owner = 1): Update => ({
   update_id: 2,
   callback_query: {
@@ -79,10 +83,10 @@ async function setup(count = 6) {
     },
   };
 }
-Deno.test('serarch searches webpage body and returns escaped results, supp links and five-result pagination', async () => {
+Deno.test('search searches webpage body and returns escaped results, supp links and five-result pagination', async () => {
   const t = await setup();
   try {
-    await t.bot.handleUpdate(command('/serarch 唯一关键词'));
+    await t.bot.handleUpdate(command('/search 唯一关键词'));
     equal(t.calls.length, 1);
     equal(t.calls[0]!.method, 'sendMessage');
     const payload = t.calls[0]!.payload, text = String(payload.text);
@@ -109,19 +113,19 @@ Deno.test('serarch searches webpage body and returns escaped results, supp links
     t.close();
   }
 });
-Deno.test('search alias works in private chats and the linked group but ignores other groups', async () => {
+Deno.test('search command works in private chats and the linked group but ignores other groups', async () => {
   const t = await setup();
   try {
     await t.bot.handleUpdate(command('/search@search_test_bot 唯一关键词', config.groupId));
     equal(t.calls.length, 1);
     equal(t.calls[0]!.payload.chat_id, config.groupId);
-    await t.bot.handleUpdate(command('/serarch 唯一关键词', -100999));
+    await t.bot.handleUpdate(command('/search 唯一关键词', -100999));
     equal(t.calls.length, 1);
     await t.bot.handleUpdate(command('/search 不存在的词', 9, 9));
     ok(String(t.calls.at(-1)!.payload.text).includes('没有找到'));
-    await t.bot.handleUpdate(command('/serarch'));
+    await t.bot.handleUpdate(command('/search'));
     ok(String(t.calls.at(-1)!.payload.text).includes('用法'));
-    await t.bot.handleUpdate(command('/serarch ' + '长'.repeat(201)));
+    await t.bot.handleUpdate(command('/search ' + '长'.repeat(201)));
     ok(String(t.calls.at(-1)!.payload.text).includes('200'));
   } finally {
     t.close();
@@ -147,10 +151,10 @@ Deno.test('preparing and unavailable indexes return friendly messages', async ()
   const t = await setup(0);
   try {
     t.search.observe(article);
-    await t.bot.handleUpdate(command('/serarch 关键词'));
+    await t.bot.handleUpdate(command('/search 关键词'));
     ok(String(t.calls.at(-1)!.payload.text).includes('索引准备中'));
     t.search.close();
-    await t.bot.handleUpdate(command('/serarch 关键词'));
+    await t.bot.handleUpdate(command('/search 关键词'));
     ok(String(t.calls.at(-1)!.payload.text).includes('暂时不可用'));
   } finally {
     t.close();
@@ -169,7 +173,7 @@ Deno.test('a full page of long titles and bodies stays within Telegram message l
         body: '正文关键词'.repeat(1000),
       });
     }
-    await t.bot.handleUpdate(command('/serarch 关键词'));
+    await t.bot.handleUpdate(command('/search 关键词'));
     const { load } = await import('cheerio');
     ok(load(String(t.calls[0]!.payload.text)).text().length <= 4096);
   } finally {
@@ -199,6 +203,62 @@ Deno.test('search middleware preserves automatic-forward binding', async () => {
     });
     equal(t.legacy.supp(supp.id).linked_group_id, 100);
     equal(t.calls.length, 0);
+  } finally {
+    t.close();
+  }
+});
+
+Deno.test('private plain text searches directly and its result pagination stays usable', async () => {
+  const t = await setup();
+  try {
+    await t.bot.handleUpdate(textMessage('  唯一关键词  ', 9, 9));
+    equal(t.calls.length, 1);
+    equal(t.calls[0]!.method, 'sendMessage');
+    equal(t.calls[0]!.payload.chat_id, 9);
+    ok(String(t.calls[0]!.payload.text).includes('共 6 条'));
+    ok(String(t.calls[0]!.payload.text).includes('搜索：唯一关键词'));
+    const markup = t.calls[0]!.payload.reply_markup as { inline_keyboard: { callback_data: string }[][] };
+    await t.bot.handleUpdate(callback(markup.inline_keyboard[0]![0]!.callback_data, 9, 9));
+    equal(t.calls[1]!.method, 'answerCallbackQuery');
+    equal(t.calls[2]!.method, 'editMessageText');
+    ok(String(t.calls[2]!.payload.text).includes('2/2'));
+  } finally {
+    t.close();
+  }
+});
+Deno.test('group plain text, removed commands, unknown slash text and private non-text messages do not search', async () => {
+  const t = await setup();
+  try {
+    await t.bot.handleUpdate(textMessage('唯一关键词', config.groupId));
+    await t.bot.handleUpdate(textMessage('唯一关键词', -100999));
+    await t.bot.handleUpdate(command('/serarch 唯一关键词'));
+    await t.bot.handleUpdate(textMessage('/serarch 唯一关键词'));
+    await t.bot.handleUpdate(textMessage('/unknown 唯一关键词'));
+    await t.bot.handleUpdate(textMessage('   '));
+    await t.bot.handleUpdate({
+      update_id: 5,
+      message: {
+        message_id: 3,
+        date: 1,
+        from: user(1),
+        chat: chat(1),
+        photo: [{ file_id: 'photo', file_unique_id: 'unique', width: 10, height: 10 }],
+        caption: '唯一关键词',
+      },
+    });
+    equal(t.calls.length, 0);
+  } finally {
+    t.close();
+  }
+});
+Deno.test('plain text shares search length validation and index availability messages', async () => {
+  const t = await setup();
+  try {
+    await t.bot.handleUpdate(textMessage('长'.repeat(201)));
+    ok(String(t.calls.at(-1)!.payload.text).includes('200'));
+    t.search.close();
+    await t.bot.handleUpdate(textMessage('唯一关键词'));
+    ok(String(t.calls.at(-1)!.payload.text).includes('暂时不可用'));
   } finally {
     t.close();
   }
