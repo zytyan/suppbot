@@ -218,3 +218,79 @@ Deno.test('retries only unsent magnet replies and never reposts the article phot
     store.close();
   }
 });
+
+Deno.test('a failed cover download never sends a placeholder or marks the channel send as uncertain', async () => {
+  const store = new Store(':memory:');
+  try {
+    const supp = store.enqueue(article, ['abc']), bot = new Bot(config.botToken);
+    let sends = 0;
+    bot.api.config.use(() => {
+      sends++;
+      throw new Error('Unexpected send');
+    });
+    const client = new TelegramClient(
+      bot,
+      config,
+      store,
+      () => Promise.reject(new Error('Cover download failed')),
+    );
+    await rejects(
+      () =>
+        client.publish(
+          supp,
+          { ...article, imgUrl: 'https://images.example.test/cover.jpg' },
+          new AbortController().signal,
+        ),
+      /Cover download failed/,
+    );
+    equal(sends, 0);
+    equal(store.meta(`channel-send:${supp.id}`), undefined);
+    equal(store.supp(supp.id).channel_id, 0);
+  } finally {
+    store.close();
+  }
+});
+Deno.test('a published cover records its true source, download attempts and returned Telegram dimensions', async () => {
+  const store = new Store(':memory:');
+  try {
+    const supp = store.enqueue(article, ['abc']), bot = new Bot(config.botToken);
+    bot.api.config.use((prev, method) => {
+      equal(method, 'sendPhoto');
+      return Promise.resolve({
+        ok: true,
+        result: {
+          message_id: 88,
+          date: 1,
+          chat: { id: config.channelId, type: 'channel', title: 'channel' },
+          photo: [{ file_id: 'cover-file', file_unique_id: 'cover-unique', width: 750, height: 400 }],
+        },
+      }) as ReturnType<typeof prev>;
+    });
+    const url = 'https://images.example.test/cover.jpg';
+    const client = new TelegramClient(
+      bot,
+      config,
+      store,
+      () =>
+        Promise.resolve({
+          bytes: new Uint8Array([255, 216, 255]),
+          filename: 'article.jpg',
+          source: 'cover',
+          url,
+          attempts: 2,
+          reason: '',
+        }),
+    );
+    await client.publish(supp, { ...article, imgUrl: url }, new AbortController().signal);
+    const state = JSON.parse(store.meta(`channel-photo:${supp.id}`)!);
+    equal(state.source, 'cover');
+    equal(state.url, url);
+    equal(state.attempts, 2);
+    equal(state.file_id, 'cover-file');
+    equal(state.width, 750);
+    equal(state.height, 400);
+    equal(store.supp(supp.id).channel_id, 88);
+  } finally {
+    store.close();
+  }
+});

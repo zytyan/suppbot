@@ -7,6 +7,7 @@ import { Store } from './store.ts';
 import { sleep } from './util.ts';
 import type { SearchService } from './search-service.ts';
 import { registerSearch } from './search-bot.ts';
+import { fetchArticlePhoto } from './article-photo.ts';
 
 export class UncertainSendError extends Error {}
 
@@ -92,7 +93,12 @@ export function formatArticlePost(supp: Supp, article: Article): { caption: stri
 }
 
 export class TelegramClient implements Telegram {
-  constructor(private bot: Bot, private config: Config, private store: Store) {}
+  constructor(
+    private bot: Bot,
+    private config: Config,
+    private store: Store,
+    private loadPhoto = fetchArticlePhoto,
+  ) {}
   // A 429 is an explicit rejection and can be retried. Transport errors after a send are ambiguous.
   private async send<T>(operation: () => Promise<T>, signal: AbortSignal): Promise<T> {
     for (let attempt = 0;; attempt++) {
@@ -134,20 +140,18 @@ export class TelegramClient implements Telegram {
     }
     const post = formatArticlePost(supp, article);
     const text = post.caption;
-    // Download before marking the remote side effect as in flight.
-    let photo = new InputFile('no_image.png');
-    if (article.imgUrl) {
-      try {
-        const response = await fetch(article.imgUrl, {
-          signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]),
-        });
-        if (!response.ok) throw new Error(`Image HTTP ${response.status}`);
-        const image = new Uint8Array(await response.arrayBuffer());
-        photo = new InputFile(image, 'article.jpg');
-      } catch {
-        signal.throwIfAborted();
-      }
-    }
+    // Complete cover retrieval before marking any remote message send as in flight.
+    const image = await this.loadPhoto(article, signal);
+    const photo = image.bytes ? new InputFile(image.bytes, image.filename) : new InputFile('no_image.png');
+    const photoState = {
+      source: image.source,
+      url: image.url,
+      attempts: image.attempts,
+      reason: image.reason,
+      prepared_at: new Date().toISOString(),
+    };
+    this.store.setMeta(`channel-photo:${supp.id}`, JSON.stringify(photoState));
+    if (image.source === 'placeholder') console.warn(`Supp #${supp.id}: ${image.reason}`);
     signal.throwIfAborted();
     this.store.setMeta(`channel-magnets:${supp.id}`, JSON.stringify(post.followups));
     this.store.setMeta(key, 'sending');
@@ -167,6 +171,17 @@ export class TelegramClient implements Telegram {
     this.store.transaction(() => {
       this.store.saveChannel(supp.id, message.chat.id, message.message_id);
       this.store.setMeta(key, 'sent');
+      const photo = message.photo?.at(-1);
+      this.store.setMeta(
+        `channel-photo:${supp.id}`,
+        JSON.stringify({
+          ...photoState,
+          sent_at: new Date().toISOString(),
+          file_id: photo?.file_id,
+          width: photo?.width,
+          height: photo?.height,
+        }),
+      );
     });
     this.store.chat(message.chat);
   }
