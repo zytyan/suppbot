@@ -11,6 +11,7 @@ import { crawlLoop, Worker } from './worker.ts';
 import { adminHandler } from './admin.ts';
 import { errorText } from './types.ts';
 import { SearchService } from './search-service.ts';
+import { syncBotCommands } from './bot-commands.ts';
 
 // The SQLite backup API includes committed WAL content without copying a live database file.
 export async function backupBeforeMigration(path: string): Promise<string | undefined> {
@@ -109,6 +110,7 @@ export async function main(): Promise<void> {
             supervise(worker.run(controller.signal)),
             supervise(crawlLoop(config, store!, crawler, runtime, controller.signal, search)),
             search!.run(controller.signal),
+            syncBotCommands(bot, config.groupId, controller.signal),
           );
         },
       });

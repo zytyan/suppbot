@@ -4,6 +4,7 @@ import { errorText, escapeHTML as e } from './types.ts';
 import { Store } from './store.ts';
 import type { SearchService } from './search-service.ts';
 import type { SearchPage } from './search-store.ts';
+import { SEARCH_COMMANDS } from './bot-commands.ts';
 
 const clip = (text: string, limit: number) =>
   text.length <= limit ? text : text.slice(0, limit - 1).replace(/[\uD800-\uDBFF]$/, '') + '…';
@@ -33,7 +34,7 @@ function buttons(id: string, result: SearchPage): InlineKeyboard {
 export function registerSearch(bot: Bot, config: Config, legacy: Store, search: SearchService): void {
   const allowed = (chat: { id: number; type: string } | undefined) =>
     chat?.type === 'private' || chat?.id === config.groupId;
-  bot.command(['serarch', 'search'], async (ctx) => {
+  bot.command(SEARCH_COMMANDS.map((command) => command.command), async (ctx) => {
     if (!allowed(ctx.chat) || !ctx.from) return;
     const query = ctx.match.trim();
     if (!query) {
