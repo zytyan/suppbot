@@ -1,0 +1,101 @@
+name: Build and Release
+
+on:
+  push:
+    branches: ['main']
+    tags: ['v*']
+  pull_request:
+    branches: ['main']
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing v* tag to publish; leave empty for build checks only'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.release_tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      commit: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate release ref
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [[ "$REF_TYPE" == tag || ( "$EVENT" == workflow_dispatch && -n "$INPUT_TAG" ) ]]; then
+            [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]] || exit 1
+            test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$(git rev-parse HEAD)"
+          fi
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates curl unzip python3 ffmpeg
+      - name: Install Deno from the official installer
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL https://deno.land/install.sh -o /tmp/deno-install.sh
+          DENO_INSTALL="$HOME/.deno" sh /tmp/deno-install.sh v2.9.3
+          echo "$HOME/.deno/bin" >> "$GITHUB_PATH"
+      - name: Install official RAR for integration tests
+        run: |
+          curl -fsSL --retry 3 https://www.rarlab.com/rar/rarlinux-x64-723.tar.gz -o /tmp/rar.tar.gz
+          echo '759b4b6aa0d9f77131882162951193f3a0e54bf60e1d8dc4255aa308accab588  /tmp/rar.tar.gz' | sha256sum --check
+          tar -xOzf /tmp/rar.tar.gz rar/rar > /tmp/rar
+          sudo install -m 0755 /tmp/rar /usr/local/bin/rar
+      - name: Check and test
+        run: |
+          unset LD_LIBRARY_PATH
+          deno task setup:simple
+          deno task check
+          deno task test
+      - name: Build and package
+        run: bash scripts/build-release.sh
+      - name: Record source commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: suppbot-linux-x86_64
+          path: |
+            dist/suppbot-linux-x86_64.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
+        with:
+          name: suppbot-linux-x86_64
+          path: dist
+      - name: Publish checked tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ inputs.release_tag || github.ref_name }}
+        run: |
+          cd dist
+          sha256sum --check SHA256SUMS
+          gh release create "$TAG" suppbot-linux-x86_64.tar.gz SHA256SUMS --verify-tag --generate-notes --title "suppbot $TAG"
